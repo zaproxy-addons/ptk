@@ -13,6 +13,8 @@ import {
     normalizeRulepack,
     resolveEffectiveSeverity
 } from "../common/severity_utils.js"
+import { resolveFindingTaxonomy } from "../common/resolveFindingTaxonomy.js"
+import normalizeFinding from "../common/findingNormalizer.js"
 
 const DEFAULT_SCAN_STRATEGY = 'SMART'
 const SCAN_STRATEGY_CONFIGS = {
@@ -78,7 +80,10 @@ export class dastEngine {
         this.reset()
         this.automationHooks = null
 
-        this._moduleLoadPromise = this.loadModules({ runCve: !!settings?.runCve })
+        this._moduleLoadPromise = this.loadModules({
+            runCve: !!settings?.runCve,
+            policy: settings?.dastScanPolicy || settings?.scanPolicy
+        })
         this._proModuleLoadPromise = this.loadProModules()
     }
 
@@ -97,16 +102,20 @@ export class dastEngine {
         this._moduleLocks = new Set()
         this._planLocks = new Set()
         this._uniqueAttackSuccess = new Set()
+        this._passiveUniqueFindingKeys = new Set()
         this._spaSeenSinks = new Set()
         this._fingerprintSet = new Set()
         this._idleResolvers = new Set()
         this._initializeStrategyState(this.strategyConfig)
         this._requestSeq = 0
         this._attackSeq = 0
+        ptk_request.clearStoredHeaders()
     }
 
     async loadModules(options = {}) {
         const runCve = !!options.runCve
+        const policyRaw = options.policy || this.settings?.dastScanPolicy || this.settings?.scanPolicy || 'ACTIVE'
+        const policy = String(policyRaw || 'ACTIVE').toUpperCase()
         const baseModules = await this._ensureBaseModules()
         let moduleDefs = Array.isArray(baseModules) ? baseModules : []
         if (runCve) {
@@ -114,6 +123,9 @@ export class dastEngine {
             if (cveModules && cveModules.length) {
                 moduleDefs = mergeModuleDefinitions(baseModules, cveModules)
             }
+        }
+        if (policy === 'RECON' || policy === 'RECONNAISSANCE' || policy === 'PASSIVE') {
+            moduleDefs = moduleDefs.filter(m => (m?.type || '').toLowerCase() === 'passive')
         }
         this.modules = moduleDefs.map(m => new ptk_module(m))
         return this.modules
@@ -194,7 +206,6 @@ export class dastEngine {
         envelope.pages = []
         envelope.runtimeEvents = []
         envelope.stats = Object.assign({}, envelope.stats, {
-            vulnsCount: 0,
             high: 0,
             medium: 0,
             low: 0,
@@ -266,7 +277,6 @@ export class dastEngine {
     updateScanResult(result, data) {
         if (!this.scanResult.stats) {
             this.scanResult.stats = {
-                vulnsCount: 0,
                 high: 0,
                 medium: 0,
                 low: 0,
@@ -291,17 +301,33 @@ export class dastEngine {
         }
 
         stats.findingsCount = stats.findingsCount || 0
-        stats.vulnsCount = stats.findingsCount
         this.scanResult.stats = stats
         this._syncScanStats()
 
         if (result) {
-            browser.runtime.sendMessage({
-                channel: "ptk_background2popup_rattacker",
-                type: "all attacks completed",
-                info: result,
-                scanResult: JSON.parse(JSON.stringify(this.scanResult))
-            }).catch(e => e)
+            const delta = this._buildPlanDelta(result)
+            if (delta) {
+                browser.runtime.sendMessage({
+                    channel: "ptk_background2popup_rattacker",
+                    type: "dast_plan_completed",
+                    delta
+                }).catch(e => e)
+            }
+        }
+    }
+
+    _buildPlanDelta(result) {
+        if (!result) return null
+        const requestRecord = result.requestRecord || null
+        const requestId = requestRecord?.id || null
+        const original = requestRecord?.original || result.original || null
+        const attacks = Array.isArray(requestRecord?.attacks)
+            ? requestRecord.attacks
+            : (Array.isArray(result.attacks) ? result.attacks : [])
+        return {
+            requestId,
+            original,
+            attacks
         }
     }
 
@@ -316,7 +342,8 @@ export class dastEngine {
         this.isRunning = true
         this.scanResult.scanId = this.scanId = ptk_utils.UUID()
         const runCveEnabled = !!(settings && settings.runCve)
-        this._moduleLoadPromise = this.loadModules({ runCve: runCveEnabled })
+        const dastScanPolicy = settings?.dastScanPolicy || settings?.scanPolicy || this.settings?.dastScanPolicy || this.settings?.scanPolicy || 'ACTIVE'
+        this._moduleLoadPromise = this.loadModules({ runCve: runCveEnabled, policy: dastScanPolicy })
 
         this.maxRequestsPerSecond = settings.maxRequestsPerSecond || this.settings.maxRequestsPerSecond
         this.concurrency = settings.concurrency || this.settings.concurrency
@@ -324,7 +351,8 @@ export class dastEngine {
         this._applyScanStrategy(requestedStrategy)
         this.scanResult.settings = Object.assign({}, this.scanResult.settings, {
             scanStrategy: this.strategyConfig.strategy,
-            runCve: runCveEnabled
+            runCve: runCveEnabled,
+            dastScanPolicy
         })
 
         this.inProgress = false
@@ -348,6 +376,7 @@ export class dastEngine {
             const finished = new Date().toISOString()
             this.scanResult.finishedAt = finished
         }
+        ptk_request.clearStoredHeaders()
     }
 
     async run() {
@@ -382,11 +411,11 @@ export class dastEngine {
 
     async onetimeScanRequest(raw) {
         let result = await this.scanRequest(raw, true)
-        let stats = { vulnsCount: 0, high: 0, medium: 0, low: 0, attacksCount: 0 }
+        let stats = { findingsCount: 0, high: 0, medium: 0, low: 0, attacksCount: 0 }
         for (let i in result.attacks) {
             stats.attacksCount++
             if (result.attacks[i].success) {
-                stats.vulnsCount++
+                stats.findingsCount++
                 if (result.attacks[i].metadata.severity == 'High') stats.high++
                 if (result.attacks[i].metadata.severity == 'Medium') stats.medium++
                 if (result.attacks[i].metadata.severity == 'Low') stats.low++
@@ -423,7 +452,7 @@ export class dastEngine {
             const moduleSupportsAtomic = this._moduleSupportsAtomic(module)
             for (const attackDef of module.attacks) {
                 const attack = module.prepareAttack(attackDef)
-                if (attack.condition) {
+                if (attack.condition && module.async !== false) {
                     const _a = { metadata: Object.assign({}, attack, module.metadata) }
                     if (!module.validateAttackConditions(_a, original)) continue
                 }
@@ -494,7 +523,8 @@ export class dastEngine {
             attackKey: attack?.id || attack?.name || `${module?.id || 'module'}:${ptk_utils.attackId()}`,
             payload,
             target: payload?.metadata?.attacked || null,
-            urlFingerprint: fingerprint || null
+            urlFingerprint: fingerprint || null,
+            deferCondition: module?.async === false && !!attack?.condition
         }
     }
 
@@ -551,6 +581,27 @@ export class dastEngine {
             severity: classification.severity || null,
             vulnId: classification.vulnId || null
         }
+        attackMeta.description = classification.description || null
+        attackMeta.recommendation = classification.recommendation || null
+        attackMeta.links = classification.links || null
+        attackMeta.owasp = classification.owasp || null
+        attackMeta.cwe = classification.cwe || null
+        attackMeta.tags = classification.tags || null
+        attackMeta.metadata = {
+            description: classification.description || null,
+            recommendation: classification.recommendation || null,
+            links: classification.links || null,
+            owasp: classification.owasp || null,
+            cwe: classification.cwe || null,
+            tags: classification.tags || null,
+            severity: classification.severity || null,
+            moduleId: classification.moduleId,
+            moduleName: classification.moduleName,
+            ruleId: classification.ruleId,
+            ruleName: classification.ruleName,
+            vulnId: classification.vulnId,
+            category: classification.category
+        }
         if (actionToken) {
             attackMeta.actionToken = actionToken
         }
@@ -573,7 +624,8 @@ export class dastEngine {
             original: plan.original,
             rateLimited: !ontime,
             respectEngineState: true,
-            notified: new Set()
+            notified: new Set(),
+            executedByModule: Object.create(null)
         }
         const attacks = []
         for (const task of plan.tasks) {
@@ -605,7 +657,8 @@ export class dastEngine {
             original: plan.original,
             rateLimited: options.rateLimited !== false,
             respectEngineState: options.respectEngineState ?? false,
-            notified: new Set()
+            notified: new Set(),
+            executedByModule: Object.create(null)
         }
 
         const launch = () => {
@@ -651,7 +704,35 @@ export class dastEngine {
                 return null
             }
 
-            const shouldThrottle = context?.rateLimited !== false
+            const moduleId = task.moduleId || task.module?.id || null
+            const executedByModule = context?.executedByModule || null
+            const requestKey = (() => {
+                const req = context?.original?.request || {}
+                const method = (req.method || '').toUpperCase()
+                const url = req.url || ''
+                return `${moduleId || 'module'}|${method}|${url}`
+            })()
+            const executedHistory = !task.moduleAsync && moduleId && executedByModule
+                ? (executedByModule[requestKey] ||= [])
+                : null
+            const recordExecuted = (entry) => {
+                if (!executedHistory || !entry) return
+                executedHistory.unshift(entry)
+                if (executedHistory.length > 5) executedHistory.pop()
+            }
+            if (executedHistory) {
+                task.module.executed = executedHistory
+            }
+            if (task.deferCondition && task.attack?.condition) {
+                const conditionPayload = { metadata: Object.assign({}, task.attack, task.module.metadata) }
+                const shouldRun = task.module.validateAttackConditions(conditionPayload, context.original)
+                if (!shouldRun) {
+                    this._notifyAttackCompleted(task, context)
+                    return null
+                }
+            }
+
+            const shouldThrottle = task.type !== 'passive' && context?.rateLimited !== false
             if (shouldThrottle) {
                 while (true) {
                     if (this.canSendRequest()) break
@@ -677,32 +758,69 @@ export class dastEngine {
                 return res
             } else if (task.type === 'active') {
                 const executed = await this.activeAttack(task.payload)
+                if (executed) {
+                    const trackingResult = await this._runTracking(task, executed)
+                    if (trackingResult?.success) {
+                        const combined = Object.assign(executed, trackingResult)
+                        this._decorateAttackResult(combined, task)
+                        if (combined?.success) {
+                            this._recordStrategyFinding(task, combined)
+                        }
+                        if (combined?.success && !this._shouldRecordSuccess(task)) {
+                            recordExecuted(combined)
+                            this._notifyAttackCompleted(task, context)
+                            return null
+                        }
+                        this._tagResultOrder(combined, task)
+                        recordExecuted(combined)
+                        this._notifyAttackCompleted(task, context)
+                        return combined
+                    }
+                }
                 if (executed && task.attack?.validation) {
                     const res = task.module.validateAttack(executed, context.original)
                     const combined = Object.assign(executed, res)
+                    if (task.attack?.id === 'jwt_1') {
+                        combined.__jwt1 = true
+                    }
                     this._decorateAttackResult(combined, task)
                     if (combined?.success) {
                         this._recordStrategyFinding(task, combined)
                     }
                     if (combined?.success && !this._shouldRecordSuccess(task)) {
+                        recordExecuted(combined)
                         this._notifyAttackCompleted(task, context)
                         return null
                     }
                     this._tagResultOrder(combined, task)
+                    recordExecuted(combined)
                     this._notifyAttackCompleted(task, context)
                     return combined
                 }
+                recordExecuted(executed)
                 this._notifyAttackCompleted(task, context)
                 return null
             } else if (task.type === 'passive') {
                 const res = task.module.validateAttack(task.payload, context.original)
                 this._notifyAttackCompleted(task, context)
                 if (res.success) {
-                    this._recordStrategyFinding(task, res)
+                    const combined = Object.assign({}, task.payload, res)
+                    combined.request =
+                        combined.request ||
+                        context.original?.request ||
+                        context.original ||
+                        null
+                    combined.response =
+                        combined.response ||
+                        context.original?.response ||
+                        null
                     if (!this._shouldRecordSuccess(task)) {
                         return null
                     }
-                    const combined = Object.assign({}, task.payload, res)
+                    if (!this._shouldRecordPassiveUnique(combined, task, context.original)) {
+                        return null
+                    }
+                    this._recordStrategyFinding(task, combined)
                     this._decorateAttackResult(combined, task)
                     this._tagResultOrder(combined, task)
                     return combined
@@ -723,12 +841,11 @@ export class dastEngine {
         if (context?.notified?.has(key)) return
         context?.notified?.add(key)
         const attack = task.attack
-        const self = this
         browser.runtime.sendMessage({
             channel: "ptk_background2popup_rattacker",
             type: "attack completed",
-            info: attack,
-            scanResult: JSON.parse(JSON.stringify(self.scanResult))
+            // Avoid cloning full scanResult for progress updates.
+            info: { name: attack?.name || task?.attack?.name || "Attack completed" }
         }).catch(e => e)
     }
 
@@ -765,6 +882,30 @@ export class dastEngine {
         return true
     }
 
+    _shouldRecordPassiveUnique(result, task, original) {
+        if (!task || !result) return true
+        const meta = task.module?.metadata || {}
+        if (meta.unique !== true) return true
+        if (task.type !== 'passive') return true
+        if (!this._passiveUniqueFindingKeys) this._passiveUniqueFindingKeys = new Set()
+
+        const moduleId = task.moduleId || task.module?.id || task.moduleName || 'module'
+        const ruleId = result.ruleId || task.attack?.id || task.attack?.name || 'rule'
+        const req = result.request || original?.request || original || {}
+        const url = req?.url || req?.ui_url || req?.uiUrl || null
+        const param =
+            result.param ||
+            result.metadata?.attacked?.name ||
+            (Array.isArray(result.metadata?.mutations) && result.metadata.mutations[0]?.name) ||
+            null
+        const key = `${moduleId}|${ruleId}|${url || ''}|${param || ''}`
+        if (this._passiveUniqueFindingKeys.has(key)) {
+            return false
+        }
+        this._passiveUniqueFindingKeys.add(key)
+        return true
+    }
+
     _isUniqueAttackAlreadySuccessful(task) {
         if (!task || !task.module) return false
         const meta = task.module.metadata || {}
@@ -785,7 +926,8 @@ export class dastEngine {
             original: plan.original,
             rateLimited: true,
             respectEngineState: true,
-            notified: new Set()
+            notified: new Set(),
+            executedByModule: Object.create(null)
         }
         this._activePlans.set(plan.id, plan)
 
@@ -1497,6 +1639,17 @@ export class dastEngine {
         try {
             let request = new ptk_request()
             if (!schema.opts) schema.opts = {}
+            schema.opts.ptk_source = 'dast'
+            const isFirefox = typeof browser !== 'undefined' && !!browser?.runtime?.getBrowserInfo
+            if (isFirefox) {
+                request.useListeners = true
+                schema.opts.use_dnr = false
+            }
+            if (typeof schema.opts.override_headers === 'undefined') {
+                schema.opts.override_headers = true
+            }
+            schema.opts.force_dnr = true
+            schema.opts.log_fingerprint = true
             if (typeof schema.opts.requestTimeoutMs === 'undefined' || schema.opts.requestTimeoutMs === null) {
                 const defaultTimeout = this.settings?.requestTimeoutMs
                 if (Number.isFinite(defaultTimeout) && defaultTimeout > 0) {
@@ -1512,9 +1665,109 @@ export class dastEngine {
     async executeOriginal(schema) {
         let _schema = JSON.parse(JSON.stringify(schema))
         let request = new ptk_request()
+        _schema.opts = _schema.opts || {}
+        _schema.opts.ptk_source = 'dast'
+        const isFirefox = typeof browser !== 'undefined' && !!browser?.runtime?.getBrowserInfo
+        if (isFirefox) {
+            request.useListeners = true
+            _schema.opts.use_dnr = false
+        }
         _schema.opts.override_headers = true
         _schema.opts.follow_redirect = true
         return Promise.resolve(request.sendRequest(_schema))
+    }
+
+    async _runTracking(task, executed) {
+        const tracking = task?.attack?.tracking
+        if (!tracking || tracking.enabled !== true) return null
+        const mode = tracking.mode || 'followup_get'
+        if (mode !== 'followup_get') return null
+
+        const marker = tracking.marker || 'PTK_UPLOAD_TEST'
+        const trackingConfidence = typeof tracking.confidence === 'number' ? tracking.confidence : 95
+        const responseBody = executed?.response?.body || ''
+        if (marker && responseBody.includes(marker)) {
+            return {
+                success: true,
+                proof: `Upload marker detected in response body.`,
+                confidence: trackingConfidence,
+                trackingConfirmed: true
+            }
+        }
+
+        const candidates = this._extractTrackingUrls(task, executed)
+        if (!candidates.length) return null
+
+        for (const url of candidates) {
+            const followup = this._buildFollowupRequest(executed, url)
+            if (!followup) continue
+            const res = await this.activeAttack(followup)
+            const body = res?.response?.body || ''
+            if (marker && body.includes(marker)) {
+                return {
+                    success: true,
+                    proof: `Upload marker retrieved from ${url}.`,
+                    tracking: { url },
+                    confidence: trackingConfidence,
+                    trackingConfirmed: true
+                }
+            }
+        }
+
+        return null
+    }
+
+    _extractTrackingUrls(task, executed) {
+        const tracking = task?.attack?.tracking || {}
+        const filename =
+            tracking.filename ||
+            task?.attack?.action?.files?.[0]?.filename ||
+            task?.attack?.metadata?.action?.files?.[0]?.filename ||
+            null
+        const urls = new Set()
+        const headers = executed?.response?.headers || []
+        const locationHeader = headers.find(
+            (h) => (h?.name || '').toLowerCase() === 'location'
+        )
+        if (locationHeader?.value) {
+            if (!filename || locationHeader.value.includes(filename)) {
+                urls.add(locationHeader.value)
+            }
+        }
+
+        const body = executed?.response?.body || ''
+        if (filename && body.includes(filename)) {
+            const escaped = filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            const absRe = new RegExp(`https?:\\/\\/[^\"'\\s<>]*${escaped}[^\"'\\s<>]*`, 'ig')
+            const relRe = new RegExp(`\\/[^\"'\\s<>]*${escaped}[^\"'\\s<>]*`, 'ig')
+            let match
+            while ((match = absRe.exec(body))) urls.add(match[0])
+            while ((match = relRe.exec(body))) urls.add(match[0])
+        }
+
+        return Array.from(urls).slice(0, 3)
+    }
+
+    _buildFollowupRequest(executed, url) {
+        if (!executed?.request?.url || !url) return null
+        let resolved = url
+        try {
+            resolved = new URL(url, executed.request.url).toString()
+        } catch {
+            return null
+        }
+
+        const schema = JSON.parse(JSON.stringify(executed))
+        schema.request = schema.request || {}
+        schema.response = {}
+        schema.request.method = 'GET'
+        schema.request.url = resolved
+        schema.request.body = null
+        schema.request.raw = null
+        schema.opts = schema.opts || {}
+        schema.opts.override_headers = true
+        schema.opts.follow_redirect = true
+        return schema
     }
 
     _sleep(ms) {
@@ -1551,20 +1804,79 @@ export class dastEngine {
         const severity = classification.severity
         const reqSchema = attack.request && attack.request.request ? attack.request.request : attack.request
         const originalReq = requestRecord?.original?.request || requestRecord?.original || {}
+        const attackRecord = attack.__requestRecordEntry || attack
+        const mutation = Array.isArray(attack?.metadata?.mutations) ? attack.metadata.mutations[0] : null
+        const payloadValue = attack?.metadata?.payload || attack?.payload || mutation?.after || attackRecord?.payload || null
+        const responseBody = attack?.response?.body || attackRecord?.response?.body
+        const responseLength = typeof responseBody === 'string'
+            ? responseBody.length
+            : (typeof attack?.length === 'number' ? attack.length : (typeof attackRecord?.length === 'number' ? attackRecord.length : null))
+        const responseTime = typeof attack?.response?.timeMs === 'number'
+            ? attack.response.timeMs
+            : (typeof attack?.timeMs === 'number'
+                ? attack.timeMs
+                : (typeof attackRecord?.response?.timeMs === 'number' ? attackRecord.response.timeMs : (typeof attackRecord?.timeMs === 'number' ? attackRecord.timeMs : null)))
         const location = {
             url: reqSchema?.url || attack.request?.url || attack.request?.ui_url || originalReq?.url || null,
             method: reqSchema?.method || attack.request?.method || originalReq?.method || null,
             param: attack.param || attack.metadata?.attacked?.name || (Array.isArray(attack.metadata?.mutations) && attack.metadata.mutations[0]?.name) || null
         }
         const logAttackId = attack.id || attack.__requestRecordEntry?.id || attack.__attackKey || null
+        const originalResponse = requestRecord?.original?.response || null
+        const originalRequest = requestRecord?.original?.request || requestRecord?.original || null
+        const attackedParam = attack.param
+            || attack.metadata?.attacked?.name
+            || (Array.isArray(attack.metadata?.mutations) && attack.metadata.mutations[0]?.name)
+            || null
+        const attackEvidence = {
+            id: logAttackId,
+            param: attackedParam || null,
+            payload: payloadValue || null,
+            proof: attackRecord?.proof || null,
+            request: attackRecord?.request || null,
+            response: attackRecord?.response || null,
+            statusCode: attackRecord?.response?.statusCode || attackRecord?.statusCode || null,
+            timeMs: responseTime,
+            length: responseLength
+        }
+        const confidenceDetails = this._resolveAttackConfidenceDetails(attack, classification)
+        const confidence = confidenceDetails.confidence
+        const attackMeta = attack?.metadata || {}
+        const attackMetaEvidence = {
+            attacked: attackMeta.attacked || null,
+            checks: attackMeta.checks || null,
+            sinkKey: attackMeta.sinkKey || null,
+            executed: typeof attackMeta.executed === 'boolean' ? attackMeta.executed : null,
+            reflected: typeof attackMeta.reflected === 'boolean' ? attackMeta.reflected : null,
+            context: attackMeta.context || null,
+            detector: attack?.detector || attackMeta.validation?.type || null,
+            match: attack?.match || null,
+            confidence: Number.isFinite(confidence) ? confidence : null
+        }
+        Object.keys(attackMetaEvidence).forEach((key) => {
+            if (attackMetaEvidence[key] === null) delete attackMetaEvidence[key]
+        })
+        if (Object.keys(attackMetaEvidence).length) {
+            attackEvidence.meta = attackMetaEvidence
+        }
         const dastEvidence = {
             attackId: logAttackId,
-            requestId: requestRecord?.id || null
+            requestId: requestRecord?.id || null,
+            param: location.param || attackedParam || null,
+            payload: payloadValue || null,
+            proof: attackRecord?.proof || null,
+            request: attackRecord?.request || reqSchema || null,
+            response: attackRecord?.response || null,
+            original: {
+                request: originalRequest || null,
+                response: originalResponse || null
+            },
+            confidenceSignals: Array.isArray(confidenceDetails.signals) ? confidenceDetails.signals : [],
+            attack: attackEvidence
         }
-        const findingId = `${this.scanResult.scanId || 'scan'}::DAST::${moduleId}::${ruleId}::${index}`
         const tags = Array.isArray(classification.tags) ? classification.tags : []
         const unifiedFinding = {
-            id: findingId,
+            id: `${this.scanResult.scanId || 'scan'}::DAST::${moduleId}::${ruleId}::${index}`,
             engine: "DAST",
             scanId: this.scanResult.scanId || null,
             moduleId,
@@ -1574,6 +1886,7 @@ export class dastEngine {
             vulnId: vulnId || moduleId,
             category: classification.category || 'dast',
             severity,
+            confidence: Number.isFinite(confidence) ? confidence : null,
             owasp: classification.owasp || null,
             cwe: classification.cwe || null,
             tags: classification.tags || [],
@@ -1586,25 +1899,36 @@ export class dastEngine {
                 dast: dastEvidence
             }
         }
-        addFinding(this.scanResult, unifiedFinding)
+        resolveFindingTaxonomy({
+            finding: unifiedFinding,
+            ruleMeta: classification.ruleMeta,
+            moduleMeta: classification.moduleMeta
+        })
+        const normalizedFinding = normalizeFinding({
+            engine: "DAST",
+            moduleMeta: classification.moduleMeta || {},
+            ruleMeta: classification.ruleMeta || {},
+            scanId: this.scanResult?.scanId || null,
+            finding: unifiedFinding
+        })
+        addFinding(this.scanResult, normalizedFinding)
         const groupKey = [
             "DAST",
-            unifiedFinding.vulnId,
+            normalizedFinding.vulnId,
             moduleId,
             ruleId,
-            location.url || "",
-            location.param || ""
+            normalizedFinding?.location?.url || location.url || "",
+            normalizedFinding?.location?.param || location.param || ""
         ].join('@@')
-        addFindingToGroup(this.scanResult, unifiedFinding, groupKey, {
-            url: location.url,
-            param: location.param || null
+        addFindingToGroup(this.scanResult, normalizedFinding, groupKey, {
+            url: normalizedFinding?.location?.url || location.url,
+            param: normalizedFinding?.location?.param || location.param || null
         })
         if (attack && typeof attack === 'object') {
-            attack.findingId = findingId
+            attack.findingId = normalizedFinding.id
             attack.__findingRecorded = true
             if (attack.__requestRecordEntry && attack.__requestRecordEntry !== attack) {
-                attack.__requestRecordEntry.findingId = findingId
-                attack.__requestRecordEntry.findingId = findingId
+                attack.__requestRecordEntry.findingId = normalizedFinding.id
             }
         }
     }
@@ -1619,6 +1943,35 @@ export class dastEngine {
         result.__moduleMetadata = moduleMeta
         result.__moduleVulnId = task.module?.vulnId || moduleMeta.vulnId || attackMeta.vulnId || null
         result.__attackKey = task.attackKey || attackMeta.id || null
+    }
+
+    _resolveAttackConfidenceDetails(attack, classification = {}) {
+        const clamp = (value) => {
+            if (!Number.isFinite(value)) return null
+            return Math.min(100, Math.max(0, Math.round(value)))
+        }
+        if (attack?.trackingConfirmed) {
+            return { confidence: 95, signals: ["tracking:confirmed"] }
+        }
+        if (attack?.metadata?.executed === true || attack?.executed === true) {
+            return { confidence: 95, signals: ["execution:confirmed"] }
+        }
+        if (Number.isFinite(attack?.confidence)) {
+            const value = clamp(attack.confidence)
+            return { confidence: value, signals: [`override:attack:${value}`] }
+        }
+        if (Number.isFinite(attack?.metadata?.confidence)) {
+            const value = clamp(attack.metadata.confidence)
+            return { confidence: value, signals: [`override:rule:${value}`] }
+        }
+        if (Number.isFinite(attack?.metadata?.confidenceDefault)) {
+            const value = clamp(attack.metadata.confidenceDefault)
+            return { confidence: value, signals: [`override:module:${value}`] }
+        }
+        if (attack?.metadata?.validation?.rule) {
+            return { confidence: 80, signals: ["validation:rule"] }
+        }
+        return { confidence: 30, signals: ["validation:none"] }
     }
 
     setAutomationHooks(hooks) {
@@ -1706,7 +2059,9 @@ export class dastEngine {
             tags,
             description,
             recommendation,
-            links
+            links,
+            moduleMeta,
+            ruleMeta: attackMeta
         }
     }
 

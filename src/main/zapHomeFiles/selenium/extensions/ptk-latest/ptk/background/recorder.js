@@ -21,6 +21,9 @@ export class ptk_recorder {
 
         this.storageKey = 'ptk_recorder'
         this.storage = { 'savedMacro': '', 'recording': {} }
+        this.debuggerTargets = new Set()
+        this.lastActiveTabId = null
+        this.activeReplayTabId = null
 
         this.reset()
     }
@@ -30,6 +33,9 @@ export class ptk_recorder {
     addListiners() {
         this.onCreated = this.onCreated.bind(this)
         browser.tabs.onCreated.addListener(this.onCreated)
+
+        this.onActivated = this.onActivated.bind(this)
+        browser.tabs.onActivated.addListener(this.onActivated)
 
         this.onUpdated = this.onUpdated.bind(this)
         browser.tabs.onUpdated.addListener(this.onUpdated)
@@ -66,6 +72,7 @@ export class ptk_recorder {
 
     removeListiners() {
         browser.tabs.onCreated.removeListener(this.onCreated)
+        browser.tabs.onActivated.removeListener(this.onActivated)
         browser.tabs.onUpdated.removeListener(this.onUpdated)
         browser.tabs.onRemoved.removeListener(this.onRemoved)
 
@@ -80,6 +87,20 @@ export class ptk_recorder {
         if (this.mode != null) {
             this.tabs.push(tab.id)
         }
+    }
+
+    onActivated(info) {
+        if (this.mode !== "recording") return
+        if (this.openerWinId && info.windowId !== this.openerWinId) return
+        if (!this.isTracking(info.tabId)) return
+        if (this.lastActiveTabId === info.tabId) return
+
+        this.lastActiveTabId = info.tabId
+
+        browser.tabs.get(info.tabId).then((tab) => {
+            if (!tab) return
+            this.recordSelectWindow(tab)
+        }).catch(() => {})
     }
 
     onUpdated(tabId, info, tab) {
@@ -187,6 +208,10 @@ export class ptk_recorder {
 
         this.openerWinId = win.id
         this.openerTabId = win.tabs[0].id
+        this.lastActiveTabId = this.openerTabId
+        if (this.mode == 'replay') {
+            this.activeReplayTabId = this.openerTabId
+        }
 
         browser.windows.update(win.id, { "focused": true })
 
@@ -196,16 +221,103 @@ export class ptk_recorder {
 
         setTimeout(function () {
             if (!worker.isFirefox && this.mode == 'recording') {
-                //Attach debugger
-                let debugTarget = { tabId: this.openerTabId }
-                chrome.debugger.attach(debugTarget, "1.3", this.onAttach())
-                chrome.debugger.sendCommand(debugTarget, "Network.setCacheDisabled", { cacheDisabled: true })
-                chrome.debugger.sendCommand(debugTarget, "Network.enable")
+                // Attach debugger for Network only during recording
+                this.ensureDebugger(this.openerTabId).then((attached) => {
+                    if (attached) {
+                        const debugTarget = { tabId: this.openerTabId }
+                        chrome.debugger.sendCommand(debugTarget, "Network.setCacheDisabled", { cacheDisabled: true }, () => {
+                            if (chrome.runtime.lastError) {
+                                // ignore missing tab
+                            }
+                        })
+                        chrome.debugger.sendCommand(debugTarget, "Network.enable", {}, () => {
+                            if (chrome.runtime.lastError) {
+                                // ignore missing tab
+                            }
+                        })
+                    }
+                })
             }
 
             browser.tabs.update(this.openerTabId, { url: startUrl })
 
         }.bind(this), 300)
+    }
+
+    async startInActiveTab(startUrl) {
+        const tabs = await browser.tabs.query({ active: true, currentWindow: true })
+        const activeTab = tabs && tabs[0]
+        if (!activeTab) {
+            throw new Error('No active tab found')
+        }
+        this.openerWinId = activeTab.windowId
+        this.openerTabId = activeTab.id
+        this.lastActiveTabId = this.openerTabId
+        if (this.mode == 'replay') {
+            this.activeReplayTabId = this.openerTabId
+        }
+
+        if (!worker.isFirefox && this.mode == 'recording') {
+            this.ensureDebugger(this.openerTabId).then((attached) => {
+                if (attached) {
+                    const debugTarget = { tabId: this.openerTabId }
+                    chrome.debugger.sendCommand(debugTarget, "Network.setCacheDisabled", { cacheDisabled: true }, () => {
+                        if (chrome.runtime.lastError) {
+                            // ignore missing tab
+                        }
+                    })
+                    chrome.debugger.sendCommand(debugTarget, "Network.enable", {}, () => {
+                        if (chrome.runtime.lastError) {
+                            // ignore missing tab
+                        }
+                    })
+                }
+            })
+        }
+
+        await browser.tabs.update(this.openerTabId, { url: startUrl })
+    }
+
+    async recordSelectWindow(tab) {
+        if (!tab) return
+        const targetOptions = []
+        if (tab.title) {
+            targetOptions.push(`title=${tab.title}`)
+        }
+        if (typeof tab.index === 'number') {
+            targetOptions.push(`index=${tab.index}`)
+        }
+        if (!targetOptions.length) return
+
+        const eventStart = Date.now()
+        const item = {
+            windowIndex: 0,
+            frameInfo: {},
+            frameStack: [],
+            eventType: 12,
+            eventTypeName: "SelectWindow",
+            data: targetOptions[0],
+            target: targetOptions[0],
+            targetOptions: targetOptions,
+            eventStart: eventStart,
+            props: { title: tab.title, index: tab.index }
+        }
+
+        const result = await browser.storage.local.get(["ptk_recording_items", "ptk_recording_log"])
+        const items = result.ptk_recording_items || []
+        if (items.length > 0) {
+            const last = items[items.length - 1]
+            if (!last.eventDuration && last.eventStart) {
+                last.eventDuration = eventStart - last.eventStart
+            }
+        }
+        items.push(item)
+
+        const log = (result.ptk_recording_log || '') + `Step #${items.length}: SelectWindow<br/>`
+        await browser.storage.local.set({
+            "ptk_recording_items": items,
+            "ptk_recording_log": log
+        })
     }
 
     findLastIndex(obj, requestId) {
@@ -224,6 +336,7 @@ export class ptk_recorder {
     }
 
     onDetach(source, reason) {
+        if (source?.tabId) this.debuggerTargets.delete(source.tabId)
         chrome.debugger.onEvent.removeListener(this.onEvent)
         chrome.debugger.onDetach.removeListener(this.onDetach)
     }
@@ -231,6 +344,7 @@ export class ptk_recorder {
     onEvent(debuggeeId, message, params) {
         let err = browser.runtime.lastError
         if (!this.isTracking(debuggeeId.tabId)) return
+        if (!this.recording || !this.recording.requests) return
 
         if (params?.request?.url?.includes("-extension://")) return
         if (params?.response?.url?.includes("-extension://")) return
@@ -278,6 +392,13 @@ export class ptk_recorder {
             }
             return Promise.resolve({ success: false })
         }
+
+        if (message.channel == "ptk_content2background_recorder") {
+            if (this["msg_" + message.type]) {
+                return this["msg_" + message.type](message, sender)
+            }
+            return Promise.resolve({ success: false })
+        }
     }
 
     async msg_init(message) {
@@ -310,15 +431,7 @@ export class ptk_recorder {
     }
 
     msg_stop_replay(message) {
-        this.cancelled = true
-        let a = this.tabs.reverse()
-        for (let i = 0; i < a.length; i++) {
-            browser.tabs.get(a[i]).then(function (tab) {
-                if (tab && tab.id) {
-                    browser.tabs.remove(tab.id).catch(e => e)
-                }
-            })
-        }
+        this.stopReplay(message)
         return Promise.resolve({ success: true })
     }
 
@@ -331,14 +444,7 @@ export class ptk_recorder {
 
     //External access
     msg_stop_recording(message) {
-        let a = this.tabs.reverse()
-        for (let i = 0; i < a.length; i++) {
-            browser.tabs.get(a[i]).then(function (tab) {
-                if (tab && tab.id) {
-                    browser.tabs.remove(tab.id).catch(e => e)
-                }
-            })
-        }
+        this.stopRecording(message)
         return Promise.resolve({ success: true, bootstrap: this.bootstrap })
     }
 
@@ -359,6 +465,71 @@ export class ptk_recorder {
     msg_replay(message) {
         this.startReplay(message.clean_cookie, message.url, message.events, message.validate_regex)
         return Promise.resolve()
+    }
+
+    async msg_select_window(message) {
+        if (this.mode !== 'replay') return Promise.resolve({ success: false })
+        const targets = []
+        if (message?.targetOptions && Array.isArray(message.targetOptions)) {
+            message.targetOptions.forEach((entry) => {
+                if (Array.isArray(entry)) {
+                    targets.push(entry[0])
+                } else {
+                    targets.push(entry)
+                }
+            })
+        }
+        if (message?.target) targets.unshift(message.target)
+        const uniqTargets = [...new Set(targets.filter(Boolean))]
+
+        const tabs = await browser.tabs.query({ windowId: this.openerWinId })
+        const matchTab = (target) => {
+            if (target.startsWith('title=')) {
+                const title = target.slice(6)
+                return tabs.find(t => t.title === title)
+            }
+            if (target.startsWith('index=')) {
+                const index = Number(target.slice(6))
+                return tabs.find(t => t.index === index)
+            }
+            return null
+        }
+
+        for (const target of uniqTargets) {
+            const tab = matchTab(target)
+            if (tab) {
+                await browser.tabs.update(tab.id, { active: true })
+                this.activeReplayTabId = tab.id
+                return Promise.resolve({ success: true })
+            }
+        }
+
+        return Promise.resolve({ success: false })
+    }
+
+    async msg_get_tab_id(message, sender) {
+        return Promise.resolve({
+            tabId: sender?.tab?.id ?? null,
+            activeReplayTabId: this.activeReplayTabId
+        })
+    }
+
+    async msg_get_active_replay_tab(message) {
+        return Promise.resolve({
+            activeReplayTabId: this.activeReplayTabId
+        })
+    }
+
+    async msg_set_window_size(message, sender) {
+        if (this.mode !== 'replay') return Promise.resolve({ success: false })
+        const windowId = sender?.tab?.windowId
+        if (!windowId) return Promise.resolve({ success: false })
+        const width = Number(message?.width)
+        const height = Number(message?.height)
+        if (!width || !height) return Promise.resolve({ success: false })
+        return browser.windows.update(windowId, { width, height })
+            .then(() => ({ success: true }))
+            .catch(() => ({ success: false }))
     }
 
     /* End Listeners */
@@ -407,13 +578,9 @@ export class ptk_recorder {
                 "ptk_path_to_icons": this.pathToIcons,
                 "ptk_double_click": this.doubleClick
             }).then(function () {
-                if (browser.extension.inIncognitoContext) {
-                    //browser.extension.isAllowedIncognitoAccess().then(function (incognito) {
-                        browser.windows.create({ url: 'about:blank', type: "popup", "incognito": true }).then(function (win) { self.onStart(win, startUrl) })
-                    //})
-                } else {
-                    browser.windows.create({ url: 'about:blank', type: "popup" }).then(function (win) { self.onStart(win, startUrl) })
-                }
+                self.startInActiveTab(startUrl).catch((e) => {
+                    console.log('Failed to start recording in active tab', e)
+                })
             })
         } else {
             ptk_notifications.notify("Recording/playback already started", "Stop recording before start a new one");
@@ -426,6 +593,7 @@ export class ptk_recorder {
         this.openerWinId = -1
         this.openerTabId = -1
         this.tabs = []
+        this.detachAllDebuggers()
         this.removeListiners()
 
         if (this.cancelled) {
@@ -437,7 +605,7 @@ export class ptk_recorder {
             if (!result) return
 
             let a = this.recording.requests
-            let b = result.ptk_recording_timing
+            let b = result.ptk_recording_timing || []
 
             for (let l = 0; l < this.recording.recordingRequests.length; l++) {
 
@@ -516,14 +684,9 @@ export class ptk_recorder {
                 "ptk_recording_confirm_required": true,
                 "ptk_path_to_icons": this.pathToIcons
             }).then(function () {
-
-                if (cleanCookie) {
-                    browser.extension.isAllowedIncognitoAccess().then(function (incognito) {
-                        browser.windows.create({ url: 'about:blank', type: "popup", "incognito": incognito }).then(function (win) { self.onStart(win, startUrl) })
-                    })
-                } else {
-                    browser.windows.create({ url: 'about:blank', type: "popup" }).then(function (win) { self.onStart(win, startUrl) })
-                }
+                self.startInActiveTab(startUrl).catch((e) => {
+                    console.log('Failed to start replay in active tab', e)
+                })
             })
         } else {
             ptk_notifications.notify("Recording/playback already started", "Stop recording before start a new one");
@@ -537,17 +700,24 @@ export class ptk_recorder {
         this.openerTabId = -1
         this.tabs = []
         this.replay = null
+        this.detachAllDebuggers()
         this.removeListiners()
-        browser.storage.local.remove([
-            "ptk_replay_items",
-            "ptk_replay_step",
-            "ptk_replay_regex",
-            "ptk_replay",
-            "ptk_recording_log",
-            "ptk_recording_confirm_required",
-            "ptk_path_to_icons",
-            "ptk_double_click"
-        ])
+        browser.storage.local.set({
+            "ptk_replay_step": -1,
+            "ptk_replay": null
+        }).then(() => {
+            browser.storage.local.remove([
+                "ptk_replay_items",
+                "ptk_replay_step",
+                "ptk_replay_regex",
+                "ptk_replay",
+                "ptk_recording_log",
+                "ptk_recording_confirm_required",
+                "ptk_path_to_icons",
+                "ptk_double_click"
+            ])
+        }).catch(() => {})
+        return
     }
 
     reset() {
@@ -560,6 +730,7 @@ export class ptk_recorder {
         this.bootstrap = null
         this.savedMacro = ""
         this.cancelled = false
+        this.detachAllDebuggers()
         delete worker.ptk_recorder_active
         browser.storage.local.remove(
             [
@@ -573,6 +744,96 @@ export class ptk_recorder {
                 "ptk_recording_log"
             ])
         this.removeListiners()
+    }
+
+    ensureDebugger(tabId) {
+        return new Promise((resolve) => {
+            if (typeof chrome === "undefined" || !chrome.debugger || worker.isFirefox) {
+                resolve(false)
+                return
+            }
+
+            if (this.debuggerTargets.has(tabId)) {
+                resolve(true)
+                return
+            }
+
+            browser.tabs.get(tabId).then(() => {
+                const debugTarget = { tabId: tabId }
+                chrome.debugger.attach(debugTarget, "1.3", () => {
+                    if (chrome.runtime.lastError) {
+                        resolve(false)
+                        return
+                    }
+                    this.debuggerTargets.add(tabId)
+                    this.onAttach()
+                    resolve(true)
+                })
+            }).catch(() => resolve(false))
+        })
+    }
+
+    detachAllDebuggers() {
+        if (typeof chrome === "undefined" || !chrome.debugger || worker.isFirefox) return
+        for (const tabId of this.debuggerTargets) {
+            const debugTarget = { tabId: tabId }
+            chrome.debugger.detach(debugTarget, () => {
+                if (chrome.runtime.lastError) {
+                    // ignore missing tab
+                }
+            })
+        }
+        this.debuggerTargets.clear()
+    }
+
+    msg_debugger_click(message, sender) {
+        if (this.mode !== 'recording') return Promise.resolve({ success: false })
+        const tabId = sender?.tab?.id
+        if (!tabId) return Promise.resolve({ success: false })
+        return this.ensureDebugger(tabId).then((attached) => {
+            if (!attached) return { success: false }
+            const debugTarget = { tabId: tabId }
+            const x = Math.max(0, Math.floor(message.x || 0))
+            const y = Math.max(0, Math.floor(message.y || 0))
+            const clickCount = message.clickCount || 1
+            return new Promise((resolve) => {
+                chrome.debugger.sendCommand(debugTarget, "Input.dispatchMouseEvent", {
+                    type: "mouseMoved",
+                    x: x,
+                    y: y
+                }, () => {
+                    if (chrome.runtime.lastError) {
+                        resolve({ success: false })
+                        return
+                    }
+                    chrome.debugger.sendCommand(debugTarget, "Input.dispatchMouseEvent", {
+                        type: "mousePressed",
+                        x: x,
+                        y: y,
+                        button: "left",
+                        clickCount: clickCount
+                    }, () => {
+                        if (chrome.runtime.lastError) {
+                            resolve({ success: false })
+                            return
+                        }
+                        chrome.debugger.sendCommand(debugTarget, "Input.dispatchMouseEvent", {
+                            type: "mouseReleased",
+                            x: x,
+                            y: y,
+                            button: "left",
+                            clickCount: clickCount
+                        }, () => {
+                            if (chrome.runtime.lastError) {
+                                resolve({ success: false })
+                                return
+                            }
+                            resolve({ success: true })
+                        })
+                    })
+                })
+            })
+        })
     }
 
     analyse() {

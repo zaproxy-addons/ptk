@@ -12,9 +12,19 @@
         "severity": "critical",
         "regex": "(text/x-component|rsc|Next\\.js|X-Powered-By:\\s*Next\\.js)",
         "proof_regex": "\\d+:E\\{\\\"digest\\\"[^\\n]*",
-        "category": "rce",
-        "cve": ["CVE-2025-55182"],
-        "aliasCve": ["CVE-2025-66478"],
+        "category": "deserialization",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2025 - Software Supply Chain Failures",
+          "A03:2021 - Injection",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cve": [
+          "CVE-2025-55182"
+        ],
+        "aliasCve": [
+          "CVE-2025-66478"
+        ],
         "products": [
           "react-server-dom-webpack",
           "react-server-dom-parcel",
@@ -43,7 +53,9 @@
           "Huntress React2Shell Campaign": "https://www.huntress.com/blog/peerblight-linux-backdoor-exploits-react2shell",
           "Searchlight High-Fidelity Detection": "https://slcyber.io/research-center/high-fidelity-detection-mechanism-for-rsc-next-js-rce-cve-2025-55182-cve-2025-66478/",
           "OffSec Technical Analysis": "https://www.offsec.com/blog/cve-2025-55182/"
-        }
+        },
+        "cveType": "rce",
+        "vulnId": "deserialization"
       },
       "attacks": [
         {
@@ -52,7 +64,9 @@
           "atomic": false,
           "metadata": {
             "description": "<p>Sends a crafted React Flight multipart/form-data payload that triggers a deterministic server-side error in vulnerable React Server Components / Next.js implementations without executing operating system commands. Detection relies on the characteristic 500 response with a <code>text/x-component</code> Flight stream that includes an <code>E{\\\"digest\\\"}</code> error chunk.</p>",
-            "notes": "<p>This probe is designed as a safe detection mechanism. It may cause 500 Internal Server Error responses and log entries on vulnerable endpoints but does not attempt to run shell commands or modify server state.</p>"
+            "notes": "<p>This probe is designed as a safe detection mechanism. It may cause 500 Internal Server Error responses and log entries on vulnerable endpoints but does not attempt to run shell commands or modify server state.</p>",
+            "category": "deserialization",
+            "vulnId": "deserialization"
           },
           "condition": {
             "and": [
@@ -214,7 +228,9 @@
           "atomic": false,
           "metadata": {
             "description": "<p>An alternate variant of the React2Shell safe probe that uses different header values and a fixed multipart boundary. This helps evade naive signature-based blocking while still triggering the same deterministic error pattern in vulnerable implementations.</p>",
-            "notes": "<p>Like the primary probe, this variant is intended only for safe detection. It should not execute OS-level commands, but it may generate 500 responses and associated logs on vulnerable endpoints.</p>"
+            "notes": "<p>Like the primary probe, this variant is intended only for safe detection. It should not execute OS-level commands, but it may generate 500 responses and associated logs on vulnerable endpoints.</p>",
+            "category": "deserialization",
+            "vulnId": "deserialization"
           },
           "condition": {
             "and": [
@@ -379,8 +395,10 @@
       "name": "Microsoft Windows 'HTTP.sys' - Remote Code Execution (CVE-2015-1635)",
       "metadata": {
         "severity": "critical",
-        "category": "rce",
-        "cve": ["CVE-2015-1635"],
+        "category": "injection",
+        "cve": [
+          "CVE-2015-1635"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -401,7 +419,15 @@
           "Ref5": "https://github.com/b1gbroth3r/shoMe"
         },
         "description": "<p>Microsoft Windows 'HTTP.sys' - Remote Code Execution</p><p>HTTP.sys in Microsoft Windows 7 SP1, Windows Server 2008 R2 SP1, Windows 8, Windows 8.1, and Windows Server 2012 Gold and R2 allows remote attackers to execute arbitrary code via crafted HTTP requests, aka \"HTTP.sys Remote Code Execution Vulnerability.\"\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2025 - Software Supply Chain Failures",
+          "A03:2021 - Injection",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "rce",
+        "vulnId": "command_injection"
       },
       "attacks": [
         {
@@ -492,8 +518,10 @@
       "name": "ThinkPHP 5.0.23 - Remote Code Execution (CVE-2018-20062)",
       "metadata": {
         "severity": "critical",
-        "category": "rce",
-        "cve": ["CVE-2018-20062"],
+        "category": "injection",
+        "cve": [
+          "CVE-2018-20062"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -511,7 +539,15 @@
           "Ref3": "https://github.com/vulhub/vulhub/tree/master/thinkphp/5-rce"
         },
         "description": "<p>ThinkPHP 5.0.23 - Remote Code Execution</p><p>An issue was discovered in NoneCms V1.3. thinkphp/library/think/App.php allows remote attackers to execute arbitrary PHP code via crafted use of the filter parameter, as demonstrated by the s=index/\\think\\Request/input&amp;filter=phpinfo&amp;data=1 query string.\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2025 - Software Supply Chain Failures",
+          "A03:2021 - Injection",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "rce",
+        "vulnId": "command_injection"
       },
       "attacks": [
         {
@@ -605,8 +641,10 @@
       "name": "WordPress Google Maps <7.11.18 - SQL Injection (CVE-2019-10692)",
       "metadata": {
         "severity": "critical",
-        "category": "sqli",
-        "cve": ["CVE-2019-10692"],
+        "category": "injection",
+        "cve": [
+          "CVE-2019-10692"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -630,7 +668,15 @@
           "Ref5": "https://github.com/VTFoundation/vulnerablewp"
         },
         "description": "<p>WordPress Google Maps &lt;7.11.18 - SQL Injection</p><p>WordPress Google Maps plugin before 7.11.18 contains a SQL injection vulnerability. The plugin includes /class.rest-api.php in the REST API and does not sanitize field names before a SELECT statement. An attacker can possibly obtain sensitive information from a database, modify data, and execute unauthorized administrative operations in the context of the affected site.\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2025 - Software Supply Chain Failures",
+          "A03:2021 - Injection",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "sqli",
+        "vulnId": "sql_injection"
       },
       "attacks": [
         {
@@ -732,8 +778,10 @@
       "name": "WordPress PayPal Pro <1.1.65 - SQL Injection (CVE-2020-14092)",
       "metadata": {
         "severity": "critical",
-        "category": "sqli",
-        "cve": ["CVE-2020-14092"],
+        "category": "injection",
+        "cve": [
+          "CVE-2020-14092"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -755,7 +803,15 @@
           "Ref5": "https://wpvulndb.com/vulnerabilities/10287"
         },
         "description": "<p>WordPress PayPal Pro &lt;1.1.65 - SQL Injection</p><p>WordPress PayPal Pro plugin before 1.1.65 is susceptible to SQL injection via the 'query' parameter which allows for any unauthenticated user to perform SQL queries with the results output to a web page in JSON format.</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2025 - Software Supply Chain Failures",
+          "A03:2021 - Injection",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "sqli",
+        "vulnId": "sql_injection"
       },
       "attacks": [
         {
@@ -865,8 +921,10 @@
       "name": "Apache Struts 2.0.0-2.5.25 - Remote Code Execution (CVE-2020-17530)",
       "metadata": {
         "severity": "critical",
-        "category": "rce",
-        "cve": ["CVE-2020-17530"],
+        "category": "injection",
+        "cve": [
+          "CVE-2020-17530"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -888,7 +946,15 @@
           "Ref5": "https://nvd.nist.gov/vuln/detail/CVE-2020-17530"
         },
         "description": "<p>Apache Struts 2.0.0-2.5.25 - Remote Code Execution</p><p>Apache Struts 2.0.0 through Struts 2.5.25 is susceptible to remote code execution because forced OGNL evaluation, when evaluated on raw user input in tag attributes, may allow it.</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2025 - Software Supply Chain Failures",
+          "A03:2021 - Injection",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "rce",
+        "vulnId": "command_injection"
       },
       "attacks": [
         {
@@ -950,8 +1016,10 @@
       "name": "Netmask NPM Package - Server-Side Request Forgery (CVE-2021-28918)",
       "metadata": {
         "severity": "critical",
-        "category": "lfi",
-        "cve": ["CVE-2021-28918"],
+        "category": "ssrf",
+        "cve": [
+          "CVE-2021-28918"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -973,7 +1041,15 @@
           "Ref5": "https://rootdaemon.com/2021/03/29/vulnerability-in-netmask-npm-package-affects-280000-projects/"
         },
         "description": "<p>Netmask NPM Package - Server-Side Request Forgery</p><p>Netmask NPM Package is susceptible to server-side request forgery because of improper input validation of octal strings in netmask npm package. This allows unauthenticated remote attackers to perform indeterminate SSRF, remote file inclusion, and local file inclusion attacks on many of the dependent packages. A remote unauthenticated attacker can bypass packages relying on netmask to filter IPs and reach critical VPN or LAN hosts.</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A01:2025 - Broken Access Control",
+          "A03:2025 - Software Supply Chain Failures",
+          "A01:2021 - Broken Access Control",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "lfi",
+        "vulnId": "ssrf"
       },
       "attacks": [
         {
@@ -1207,9 +1283,19 @@
       "name": "Thinkphp Lang - Local File Inclusion (CVE-2022-47945)",
       "metadata": {
         "severity": "critical",
-        "category": "lfi",
-        "cve": ["CVE-2022-47945"],
-        "tags": ["cve", "nuclei", "cve2022", "thinkphp", "lfi", "vkev", "vuln"],
+        "category": "path_traversal",
+        "cve": [
+          "CVE-2022-47945"
+        ],
+        "tags": [
+          "cve",
+          "nuclei",
+          "cve2022",
+          "thinkphp",
+          "lfi",
+          "vkev",
+          "vuln"
+        ],
         "links": {
           "NVD": "https://nvd.nist.gov/vuln/detail/CVE-2022-47945",
           "Ref1": "https://tttang.com/archive/1865/",
@@ -1219,7 +1305,15 @@
           "Ref5": "https://github.com/ARPSyndicate/kenzer-templates"
         },
         "description": "<p>Thinkphp Lang - Local File Inclusion</p><p>ThinkPHP Framework before 6.0.14 allows local file inclusion via the lang parameter when the language pack feature is enabled (lang_switch_on=true). An unauthenticated and remote attacker can exploit this to execute arbitrary operating system commands, as demonstrated by including pearcmd.php.\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A01:2025 - Broken Access Control",
+          "A03:2025 - Software Supply Chain Failures",
+          "A01:2021 - Broken Access Control",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "lfi",
+        "vulnId": "path_traversal"
       },
       "attacks": [
         {
@@ -1379,8 +1473,10 @@
       "name": "Gibbon v25.0.0 - Local File Inclusion (CVE-2023-34598)",
       "metadata": {
         "severity": "critical",
-        "category": "lfi",
-        "cve": ["CVE-2023-34598"],
+        "category": "path_traversal",
+        "cve": [
+          "CVE-2023-34598"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -1400,7 +1496,15 @@
           "Ref5": "https://github.com/komodoooo/Some-things"
         },
         "description": "<p>Gibbon v25.0.0 - Local File Inclusion</p><p>Gibbon v25.0.0 is vulnerable to a Local File Inclusion (LFI) vulnerability where it's possible to include the content of several files present in the installation folder in the server's response.\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A01:2025 - Broken Access Control",
+          "A03:2025 - Software Supply Chain Failures",
+          "A01:2021 - Broken Access Control",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "lfi",
+        "vulnId": "path_traversal"
       },
       "attacks": [
         {
@@ -1486,8 +1590,10 @@
       "name": "Hotel Booking Lite < 4.8.5 - Arbitrary File Download & Deletion (CVE-2023-5991)",
       "metadata": {
         "severity": "critical",
-        "category": "lfi",
-        "cve": ["CVE-2023-5991"],
+        "category": "path_traversal",
+        "cve": [
+          "CVE-2023-5991"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -1507,7 +1613,15 @@
           "Ref2": "https://nvd.nist.gov/vuln/detail/CVE-2023-5991"
         },
         "description": "<p>Hotel Booking Lite &lt; 4.8.5 - Arbitrary File Download &amp; Deletion</p><p>The Hotel Booking Lite WordPress plugin before 4.8.5 does not validate file paths provided via user input, as well as does not have proper CSRF and authorisation checks, allowing unauthenticated users to download and delete arbitrary files on the server\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A01:2025 - Broken Access Control",
+          "A03:2025 - Software Supply Chain Failures",
+          "A01:2021 - Broken Access Control",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "lfi",
+        "vulnId": "path_traversal"
       },
       "attacks": [
         {
@@ -1601,8 +1715,10 @@
       "name": "WordPress Automatic Plugin <3.92.1 - Arbitrary File Download and SSRF (CVE-2022-1970)",
       "metadata": {
         "severity": "critical",
-        "category": "lfi",
-        "cve": ["CVE-2022-1970"],
+        "category": "ssrf",
+        "cve": [
+          "CVE-2022-1970"
+        ],
         "tags": [
           "cve",
           "nuclei",
@@ -1624,7 +1740,15 @@
           "Ref3": "https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2024-27954"
         },
         "description": "<p>WordPress Automatic Plugin &lt;3.92.1 - Arbitrary File Download and SSRF</p><p>WordPress Automatic plugin &lt;3.92.1 is vulnerable to unauthenticated Arbitrary File Download and SSRF Located in the downloader.php file, could permit attackers to download any file from a site. Sensitive data, including login credentials and backup files, could fall into the wrong hands. This vulnerability has been patched in version 3.92.1.\n</p>",
-        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>"
+        "recommendation": "<p>Use the PTK proof to verify impact, then patch/upgrade to a fixed version per vendor advisory. Apply compensating controls (WAF rules, access restrictions) where patching is not immediate.</p>",
+        "owasp": [
+          "A01:2025 - Broken Access Control",
+          "A03:2025 - Software Supply Chain Failures",
+          "A01:2021 - Broken Access Control",
+          "A06:2021 - Vulnerable and Outdated Components"
+        ],
+        "cveType": "lfi",
+        "vulnId": "ssrf"
       },
       "attacks": [
         {

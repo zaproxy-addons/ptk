@@ -21,6 +21,66 @@ const controller = new ptk_controller_rbuilder()
 controller.waiting = false
 const decoder = new ptk_decoder()
 const jwtHelper = new ptk_jwtHelper()
+const RB_SEVERITY_KEYS = ['critical', 'high', 'medium', 'low', 'info']
+
+function createSeverityCounters() {
+    return {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        info: 0
+    }
+}
+
+function createEmptyCounters() {
+    return {
+        total: 0,
+        vuln: 0,
+        nonvuln: 0,
+        s4xx: 0,
+        s5xx: 0,
+        vuln4xx: 0,
+        vuln5xx: 0,
+        severity: createSeverityCounters(),
+        severity4xx: createSeverityCounters(),
+        severity5xx: createSeverityCounters()
+    }
+}
+
+function normalizeSeverityKey(value) {
+    if (!value) return 'info'
+    let normalized = String(value || '').toLowerCase()
+    if (normalized === 'informational') {
+        normalized = 'info'
+    }
+    return RB_SEVERITY_KEYS.includes(normalized) ? normalized : 'info'
+}
+
+function applyCountersUpdate(target, meta) {
+    if (!target || !meta) return
+    target.total += 1
+    if (meta.is4xx) {
+        target.s4xx += 1
+    }
+    if (meta.is5xx) {
+        target.s5xx += 1
+    }
+    if (meta.isVuln) {
+        target.vuln += 1
+        const severityKey = normalizeSeverityKey(meta.severity)
+        target.severity[severityKey] += 1
+        if (meta.is4xx) {
+            target.vuln4xx += 1
+            target.severity4xx[severityKey] += 1
+        } else if (meta.is5xx) {
+            target.vuln5xx += 1
+            target.severity5xx[severityKey] += 1
+        }
+    } else {
+        target.nonvuln += 1
+    }
+}
 
 
 class rbuilderUI {
@@ -28,6 +88,8 @@ class rbuilderUI {
     constructor() {
         this.storage = []
         this.updating = false
+        this.scanCounters = createEmptyCounters()
+        this.scanFilterScope = 'all'
         this.initParser()
     }
 
@@ -206,8 +268,12 @@ class rbuilderUI {
             $('#request_form .showScanResult').hide()
         }
 
-        $form.form('set value', 'response_headers', item.response.statusLine + '\r\n' + item.response.headers.map(x => { return x.name + ": " + x.value }).join('\r\n'))
-        $form.form('set value', 'response_body', item.response.body)
+        const resp = item.response || {}
+        const respHeaders = Array.isArray(resp.headers) ? resp.headers : []
+        const statusLine = resp.statusLine || ''
+        const headerText = respHeaders.map(x => { return x.name + ": " + x.value }).join('\r\n')
+        $form.form('set value', 'response_headers', statusLine + (headerText ? '\r\n' + headerText : ''))
+        $form.form('set value', 'response_body', resp.body || '')
 
         this.updating = false
     }
@@ -376,9 +442,8 @@ class rbuilderUI {
     resetScanResult() {
         $("#progress_message").hide()
         $('#attacks_info').html("")
-        $('#filter_vuln').removeClass('active')
-        $('#filter_all').addClass('active')
-        this.bindStats({ stats: { attacksCount: 0, vulnsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 } })
+        this.scanCounters = createEmptyCounters()
+        this.setScanFilterScope('all')
     }
 
     bindAttackProgress(message) {
@@ -403,13 +468,64 @@ class rbuilderUI {
     }
 
     bindStats(scanResult) {
-        const stats = scanResult?.stats || {}
-        rutils.bindStats(stats, 'rbuilder')
-        const vulns = stats.vulnsCount ?? stats.findingsCount ?? 0
-        if (vulns > 0) {
-            $('#filter_vuln').trigger("click")
+        this.scanCounters = createEmptyCounters()
+        const attacks = Array.isArray(scanResult?.attacks) ? scanResult.attacks : []
+        attacks.forEach((attack) => {
+            const meta = rutils.getMiscMeta(attack)
+            applyCountersUpdate(this.scanCounters, meta)
+        })
+        this.renderStatsFromCounters()
+        if (this.scanFilterScope === 'all' && this.scanCounters.vuln > 0) {
+            this.setScanFilterScope('vuln')
         }
         return false
+    }
+
+    renderStatsFromCounters() {
+        const base = this.scanCounters || createEmptyCounters()
+        let attacksCount = base.total
+        let findingsCount = base.vuln
+        let severity = base.severity
+        if (this.scanFilterScope === '400') {
+            attacksCount = base.s4xx
+            findingsCount = base.vuln4xx
+            severity = base.severity4xx
+        } else if (this.scanFilterScope === '500') {
+            attacksCount = base.s5xx
+            findingsCount = base.vuln5xx
+            severity = base.severity5xx
+        }
+        rutils.bindStats({
+            attacksCount,
+            findingsCount,
+            critical: severity.critical,
+            high: severity.high,
+            medium: severity.medium,
+            low: severity.low,
+            info: severity.info
+        }, 'rbuilder')
+    }
+
+    setScanFilterScope(scope) {
+        this.scanFilterScope = scope
+        $('#filter_all, #filter_vuln, #filter_400, #filter_500').removeClass('active primary')
+        if (scope === 'vuln') {
+            $('#filter_vuln').addClass('active primary')
+            $('.attack_info').show()
+            $('.attack_info.nonvuln').hide()
+        } else if (scope === '400') {
+            $('#filter_400').addClass('active primary')
+            $('.attack_info').hide()
+            $('.attack_info.4xx_status').show()
+        } else if (scope === '500') {
+            $('#filter_500').addClass('active primary')
+            $('.attack_info').hide()
+            $('.attack_info.5xx_status').show()
+        } else {
+            $('#filter_all').addClass('active primary')
+            $('.attack_info').show()
+        }
+        this.renderStatsFromCounters()
     }
 }
 
@@ -507,15 +623,19 @@ jQuery(function () {
     //  Scan handlers //
 
     $('#filter_all').on("click", function () {
-        $('.attack_info').show()
-        $('#filter_vuln').removeClass('active')
-        $('#filter_all').addClass('active')
+        rbuilder.setScanFilterScope('all')
     })
 
     $('#filter_vuln').on("click", function () {
-        $('.attack_info.nonvuln').hide()
-        $('#filter_all').removeClass('active')
-        $('#filter_vuln').addClass('active')
+        rbuilder.setScanFilterScope('vuln')
+    })
+
+    $('#filter_400').on("click", function () {
+        rbuilder.setScanFilterScope('400')
+    })
+
+    $('#filter_500').on("click", function () {
+        rbuilder.setScanFilterScope('500')
     })
 
     $.fn.selectRange = function (start, end) {

@@ -29,65 +29,52 @@
 </head>
 
 <body>
-  <div id="mainMenuWrapper">
-    <!-- <div class="ui segment clearing info_tab">
-            <div id="dashboard_message_text" class="ui left floated header short_message_text"
-            style="width: calc(100vw - 160px);"></div>
-            <div class="ui right floated header icons"
-                style="padding-top:5px; padding-right: 4px !important;">
-                <div class="ui mini right floated icon button"><i class="trash all alternate large icon reset"
-                        title="Reset"></i>
-                </div>
-                <div class="ui secondary small right floated button run_scan" >Scan</div>
-            </div>
-        </div> -->
-
-
-    <div class="ui segment clearing info_tab">
-      <div style="padding-top: 5px; padding-right: 4px;">
-        <div class="ui small button generate_report" style="display: none;margin-left: -11px;">Generate
-          report</div>
-        <!-- <div class="ui small secondary button save_scan" style="display: none; position: relative">Save
-          scan<i class="right floated cloud upload icon" style="padding-left: 8px;"></i>
-          <div style="position:absolute; top:0px;right: 0px">
-            <div class="ui  centered inline inverted loader"></div>
-          </div>
-        </div> -->
-
-        <!-- <div class="ui small secondary button exchange" style="display: none; position: relative">
-                    Import/Export<i class="right floated exchange icon" style="padding-left: 8px;"></i>
-                    <div style="position:absolute; top:0px;right: 0px">
-                        <div class="ui  centered inline inverted loader"></div>
-                    </div>
-                </div> -->
-
-        <div class="ui mini message scan_info" style="display: none">
-          <div class="ui header">Scanning <span id="scanning_url"></span></div>
+  <div class="ui segment clearing info_tab">
+    <div style="padding-top: 5px; padding-right: 4px;">
+      <div class="ui small button generate_report" style="display: none;margin-left: -11px;">Generate
+        report</div>
+      <!-- <div class="ui small secondary button save_scan" style="display: none; position: relative">Save
+        scan<i class="right floated cloud upload icon" style="padding-left: 8px;"></i>
+        <div style="position:absolute; top:0px;right: 0px">
+          <div class="ui  centered inline inverted loader"></div>
         </div>
-        <!-- <div class="ui mini right floated icon button " ><i class="settings rattacker large icon"
-                    title="Settings"></i></div> -->
-        <div class="ui mini right floated icon button"><i class="trash all alternate large icon reset" title="Reset"></i>
-        </div>
-        <!-- <div class="ui mini right floated icon button cloud_download_scans"><i class="cloud download alternate large icon" title="Download from cloud"></i>
-        </div> -->
-        <div class="ui mini right floated icon button import_export"><i class="exchange alternate large icon" title="Import/Export"></i>
-        </div>
+      </div> -->
 
-        <div class="ui secondary small right floated button run_scan_runtime" id="run_scan_bg_control">Scan in
-          runtime</div>
-        <div class="ui secondary small right floated button stop_scan_runtime" id="stop_scan_bg_control" style="display:none">Stop runtime scan</div>
+      <!-- <div class="ui small secondary button exchange" style="display: none; position: relative">
+                  Import/Export<i class="right floated exchange icon" style="padding-left: 8px;"></i>
+                  <div style="position:absolute; top:0px;right: 0px">
+                      <div class="ui  centered inline inverted loader"></div>
+                  </div>
+              </div> -->
+
+      <div class="ui mini message scan_info" style="display: none">
+        <div class="ui header">Scanning <span id="scanning_url"></span></div>
       </div>
+      <!-- <div class="ui mini right floated icon button " ><i class="settings rattacker large icon"
+                  title="Settings"></i></div> -->
+      <div class="ui mini right floated icon button"><i class="trash all alternate large icon reset" title="Reset"></i>
+      </div>
+      <!-- <div class="ui mini right floated icon button cloud_download_scans"><i class="cloud download alternate large icon" title="Download from cloud"></i>
+      </div> -->
+      <div class="ui mini right floated icon button import_export"><i class="exchange alternate large icon" title="Import/Export"></i>
+      </div>
+
+      <div class="ui secondary small right floated button run_scan_runtime" id="run_scan_bg_control">Scan in
+        runtime</div>
+      <div class="ui secondary small right floated button stop_scan_runtime" id="stop_scan_bg_control" style="display:none">Stop runtime scan</div>
+    </div>
+  </div>
+  <div id="pagecontent">
+    <div id="sca_page_loader" class="ui active inverted dimmer" style="display:block; position: fixed; top: 46px; left: 0; width: 100%; height: 100%; z-index: 2;">
+      <div class="ui massive text loader">Loading</div>
     </div>
 
-  </div>
-  <div id="pagecontent" style="padding-top:80px">
-
-    <div id="main">
-      <table class="ui tiny table" style="padding:0;margin:0;border:none;width:100%">
+    <div id="main" style="display:none;height: 100%;height:100%;width: 100%;position: fixed; top: 46px;z-index: 1;">
+      <table class="ui tiny table" style="padding:0;margin:0;border:none;width:100%;height: 100%;">
         <tbody>
           <tr>
             <td style="min-width:50px; vertical-align: text-top; padding: 0px;">
-              <div class="eight wide field" style="padding-right: 1px;">
+              <div class="eight wide field" style="padding-right: 1px;height: 91vh;">
                 <div class="field rattacker" style="scrollbar-width: none;height: 100% !important;min-height: 85vh; position: relative;">
 
                   <div class="ui items styled accordion" id="sca_component_list" style="width: 100%; overflow: scroll;position:absolute; margin: 0px;scrollbar-width: none;">
@@ -99,12 +86,12 @@
               </div>
             </td>
             <td style="width:50%;margin: 0px; padding: 0px 0px 0px 2px;border: none;vertical-align: top;">
-              <div class="eight wide field" style="padding-left: 1px;">
+              <div class="eight wide field" style="padding-left: 1px;height: 91vh;">
                 <div class="field rattacker" style="scrollbar-width: none;height: 100% !important;min-height: 85vh;">
-                  <div class="ui tiny message" style="position: sticky;top: 0px;z-index: 1; min-height: 80px;padding-top:15px; width: 100%;">
+                  <div class="ui tiny message" style="position: sticky;top: 0px;z-index: 1; min-height: 80px;padding:0px">
 
                     <br />
-                    <div class="ui mini statistics ptk-summary-stats" style="margin-top:5px; display: inline-block; position: absolute;left: 20px;">
+                    <div class="ui mini statistics ptk-summary-stats" style="margin-top:20px; display: inline-block; position: absolute;left: 20px;">
                       <div class="statistic">
                         <div class="label">Packages</div>
                         <div class="value" id="components_count">0</div>
@@ -114,25 +101,25 @@
                         <div class="value" id="sca_vulns_count">0</div>
                       </div>
                     </div>
-                    <div class="ui mini statistics ptk-severity-stats" style="margin-top:5px;display: inline-block; position: absolute;right: 20px;">
+                    <div class="ui mini statistics ptk-severity-stats" style="margin-top:20px;display: inline-block; position: absolute;right: 20px;">
                       <div class="statistic">
-                        <div class="label"><i class="fire red icon"></i>Critical</div>
+                        <div class="label"><i class="fire ptk-sev-critical icon"></i>Critical</div>
                         <div class="value" id="sca_critical_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="exclamation triangle red icon"></i>High</div>
+                        <div class="label"><i class="exclamation triangle ptk-sev-high icon"></i>High</div>
                         <div class="value" id="sca_high_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="exclamation triangle orange icon"></i>Medium</div>
+                        <div class="label"><i class="exclamation triangle ptk-sev-medium icon"></i>Medium</div>
                         <div class="value" id="sca_medium_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="exclamation triangle yellow icon"></i>Low</div>
+                        <div class="label"><i class="exclamation triangle ptk-sev-low icon"></i>Low</div>
                         <div class="value" id="sca_low_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="info circle blue icon"></i>Info</div>
+                        <div class="label"><i class="info circle ptk-sev-info icon"></i>Info</div>
                         <div class="value" id="sca_info_count">0</div>
                       </div>
                     </div>
@@ -148,38 +135,26 @@
           </tr>
         </tbody>
       </table>
+    </div>
 
-
-
-      <div style="height: 100%;display:none" id="welcome_message">
-        <div class="ui message" style="height:100%;width: 100%;position: absolute; top: 80px;z-index: 1;">
-
-          <div class="content" style="padding-bottom: 10px;">
-            SCA, or Software Composition Analysis, is an application security methodology that helps
-            identify and manage risks associated with open-source software components used in a project. By
-            scanning JavaScript dependencies, OWASP PTK will identify security risks associated with open-source and
-            third-party components.
+    <div id="welcome_message" class="ptk-welcome" style="display:none;">
+      <div class="ui message ptk-welcome-msg">
+        <div class="ptk-welcome-top">
+          <div class="content ptk-welcome-desc">
+            SCA, or Software Composition Analysis, is an application security methodology that helps identify and manage risks associated with open-source software components used in a project. By scanning JavaScript dependencies, OWASP PTK will identify security risks associated with open-source and third-party components.
           </div>
           <div class="header">How to scan an application:</div>
-          <div class="content" style="margin-top: -15px;">
+          <div class="content ptk-welcome-steps">
             <ul>
-              <li>Click the "Scan in runtime" button and confirm it's starting
-              </li>
-              <li>Start browsing the application you are scanning, eg click on
-                different
-                links, submit forms, etc</li>
+              <li>Click the "Scan in runtime" button and confirm it's starting</li>
+              <li>Start browsing the application you are scanning, e.g. click on different links, submit forms, etc.</li>
               <li>Once completed open SCA scanner and stop the scan</li>
               <li>Check the result</li>
             </ul>
           </div>
-
         </div>
-
-
       </div>
     </div>
-
-
   </div>
 
   <div class="ui mini modal coupled error" id="result_dialog">
@@ -261,7 +236,7 @@
     </div>
   </div>
 
-  <div id="run_scan_dlg" class="ui tiny modal coupled second" style="display: none;">
+  <div id="run_scan_dlg" class="ui small modal coupled second" style="display: none;">
     <i class="close icon"></i>
     <div class="header">Confirm scan execution</div>
 
@@ -269,7 +244,12 @@
       <div class="ui message" style="margin: -20px -20px 0px -20px;">
         <p>Are you sure you want to run SCA scan against <span id="scan_host" style="font-weight: 600;"></span>?</p>
       </div>
+      <div id="ptk_scan_reload_warning" class="ui warning message ptk-reload-warning ptk-reload-warning-sca">
+        <i id="ptk_scan_reload_warning_close_sca" class="close icon"></i>
+        Reload this tab to enable runtime scans (IAST/SAST). SCA can still run.
+      </div>
     </div>
+    <br />
     <div class="actions">
       <div class="ui cancel button">Cancel</div>
       <div class="ui approve button secondary confirm_scan_run">Run scan</div>

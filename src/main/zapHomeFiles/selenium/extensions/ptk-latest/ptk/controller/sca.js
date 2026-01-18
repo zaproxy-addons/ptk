@@ -119,4 +119,13 @@ export class ptk_controller_sca {
         }).catch(e => e)
     }
 
+    async exportScanResult(target = "download") {
+        return browser.runtime.sendMessage({
+            channel: "ptk_popup2background_sca",
+            type: "export_scan_result",
+            target
+        }).then(response => response)
+            .catch(e => e)
+    }
+
 }

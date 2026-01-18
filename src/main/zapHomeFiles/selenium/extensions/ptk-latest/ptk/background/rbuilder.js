@@ -169,6 +169,35 @@ export class ptk_request_manager {
 
 
 export class ptk_request {
+    static _dnrLock = Promise.resolve()
+    static _storedHeaderMap = new Map()
+    static _storedHeaderTtlMs = 120000
+
+    static clearStoredHeaders() {
+        this._storedHeaderMap.clear()
+    }
+
+    static _purgeStoredHeaders(now = Date.now()) {
+        for (const [key, value] of this._storedHeaderMap.entries()) {
+            const ts = value?.ts || 0
+            if (now - ts > this._storedHeaderTtlMs) {
+                this._storedHeaderMap.delete(key)
+            }
+        }
+    }
+
+    static async _withDnrLock(fn) {
+        const prev = this._dnrLock
+        let release
+        const next = new Promise((resolve) => { release = resolve })
+        this._dnrLock = prev.then(() => next)
+        await prev
+        try {
+            return await fn()
+        } finally {
+            release()
+        }
+    }
 
     constructor() {
         this.init()
@@ -229,16 +258,37 @@ export class ptk_request {
     }
 
     onBeforeSendHeaders(request) {
-        if (this.trackingRequest?.has('originalHeaders')) {
-            request.requestHeaders = this.trackingRequest.get('originalHeaders')
-            this.trackingRequest.delete('originalHeaders')
+        const reqIdHeader = (request.requestHeaders || []).find(
+            (h) => (h?.name || '').toLowerCase() === 'x-ptk-reqid'
+        )?.value
+        const sourceHeader = (request.requestHeaders || []).find(
+            (h) => (h?.name || '').toLowerCase() === 'x-ptk-source'
+        )?.value
+
+        // Check if we have stored headers to apply for this request
+        let modifiedHeaders = request.requestHeaders
+        ptk_request._purgeStoredHeaders()
+        if (reqIdHeader && sourceHeader && ptk_request._storedHeaderMap.has(reqIdHeader)) {
+            const stored = ptk_request._storedHeaderMap.get(reqIdHeader)
+            if (stored?.source !== sourceHeader) {
+                ptk_request._storedHeaderMap.delete(reqIdHeader)
+            } else {
+                const storedHeaders = stored?.headers || []
+                modifiedHeaders = storedHeaders
+                ptk_request._storedHeaderMap.delete(reqIdHeader)
+            }
         }
 
         if (this.trackingRequest?.has(request.requestId)) {
-            this.trackingRequest.get(request.requestId).request.requestHeaders = request.requestHeaders
+            const entry = this.trackingRequest.get(request.requestId)
+            entry.request.requestHeaders = modifiedHeaders
+            if (reqIdHeader) {
+                entry.ptkReqId = reqIdHeader
+                this.trackingRequest.set(`ptk:${reqIdHeader}`, entry)
+            }
         }
 
-        return { requestHeaders: request.requestHeaders }
+        return { requestHeaders: modifiedHeaders }
     }
 
 
@@ -537,12 +587,98 @@ export class ptk_request {
         let ruleId = null
         this.trackingRequest = new Map()
 
-        if (schema.opts.override_headers != false && schema.request.headers.length > 0) {
-            ruleId = parseInt((Math.floor(Math.random() * 6) + 1) + Math.floor((Date.now() * Math.random() * 1000)).toString().substr(-8, 8))
-            await ptk_ruleManager.addSessionRule(schema, ruleId)
-            this.trackingRequest.set('originalHeaders', JSON.parse(JSON.stringify(schema.request.headers)))
+        const headerList = schema.request.headers || []
+        const overrideHeaders = schema.opts.override_headers != false
+        let effectiveCredentials = schema?.opts?.credentials || 'include'
+        const hasCookieHeader = headerList.some(
+            (h) => (h.name || '').toLowerCase() === 'cookie'
+        )
+        const hasOriginHeader = headerList.some(
+            (h) => (h.name || '').toLowerCase() === 'origin'
+        )
+        const hasRefererHeader = headerList.some(
+            (h) => (h.name || '').toLowerCase() === 'referer'
+        )
+        const hasUserAgentHeader = headerList.some(
+            (h) => (h.name || '').toLowerCase() === 'user-agent'
+        )
+        let hostMismatch = false
+        const hostHeader = headerList.find(
+            (h) => (h.name || '').toLowerCase() === 'host'
+        )?.value
+        if (hostHeader) {
+            try {
+                const urlHost = new URL(schema.request.url).host
+                hostMismatch = hostHeader !== urlHost
+            } catch (_) {
+                hostMismatch = true
+            }
+        }
+        const needsDnr =
+            hasCookieHeader ||
+            hasOriginHeader ||
+            hasRefererHeader ||
+            hasUserAgentHeader ||
+            hostMismatch
+        const useDnr =
+            (schema?.opts?.use_dnr !== false) &&
+            overrideHeaders &&
+            (needsDnr || schema?.opts?.force_dnr === true)
+
+        if (overrideHeaders && !hasCookieHeader && effectiveCredentials === 'include') {
+            // Prevent browser cookies from leaking when request doesn't specify Cookie.
+            effectiveCredentials = 'omit'
         }
 
+        // Strip cache validators for active requests.
+        const cacheValidatorNames = new Set([
+            'if-none-match',
+            'if-modified-since',
+            'if-match',
+            'if-unmodified-since'
+        ])
+        let effectiveHeaders = headerList.filter(
+            (h) => !cacheValidatorNames.has((h?.name || '').toLowerCase())
+        )
+
+        // Ensure Cookie header is explicit when cookies are present.
+        const hasCookiesArray = Array.isArray(schema?.request?.cookies) && schema.request.cookies.length > 0
+        const hasCookieHeaderAfter = effectiveHeaders.some(
+            (h) => (h.name || '').toLowerCase() === 'cookie'
+        )
+        if (hasCookiesArray && !hasCookieHeaderAfter) {
+            const cookieValue = schema.request.cookies
+                .map((c) => `${c.name}=${c.value}`)
+                .join('; ')
+            effectiveHeaders.push({ name: 'Cookie', value: cookieValue })
+        }
+
+        // Attach request id header for tracking correlation.
+        const ptkReqId = schema?.opts?.ptk_req_id || ptk_utils.attackParamId()
+        schema.opts.ptk_req_id = ptkReqId
+        if (!effectiveHeaders.some((h) => (h.name || '').toLowerCase() === 'x-ptk-reqid')) {
+            effectiveHeaders.push({ name: 'X-PTK-ReqId', value: ptkReqId })
+        }
+        let ptkSource = schema?.opts?.ptk_source
+        if (!ptkSource && this.useListeners) {
+            ptkSource = 'rbuilder'
+        }
+        if (ptkSource && !effectiveHeaders.some((h) => (h.name || '').toLowerCase() === 'x-ptk-source')) {
+            effectiveHeaders.push({ name: 'X-PTK-Source', value: String(ptkSource) })
+        }
+
+        if (effectiveCredentials === 'omit') {
+            effectiveHeaders = effectiveHeaders.filter(
+                (h) => (h.name || '').toLowerCase() !== 'cookie'
+            )
+        }
+        schema.request.headers = effectiveHeaders
+
+        // Store headers for WebRequest to apply (Firefox)
+        if (this.useListeners && ptkReqId) {
+            const webRequestHeaders = effectiveHeaders.map(h => ({ name: h.name, value: h.value }))
+            ptk_request._storedHeaderMap.set(ptkReqId, { headers: webRequestHeaders, ts: Date.now(), source: ptkSource || null })
+        }
 
         const timeoutMs = Number(schema?.opts?.requestTimeoutMs)
         let controller = null
@@ -551,15 +687,19 @@ export class ptk_request {
             controller = new AbortController()
             timeoutId = setTimeout(() => controller.abort(), timeoutMs)
         }
+        const getHeaderValue = (headers, name) => {
+            const target = name.toLowerCase()
+            return (headers || []).find((h) => (h?.name || '').toLowerCase() === target)?.value || ''
+        }
+        const logFingerprint = schema?.opts?.log_fingerprint === true
         let h = {}
-        for (let i = 0; i < schema.request.headers.length; i++) {
-            let item = schema.request.headers[i]
+        for (let i = 0; i < effectiveHeaders.length; i++) {
+            let item = effectiveHeaders[i]
             h[item.name] = item.value
         }
-
         let params = {
             method: schema.request.method,
-            credentials: 'include',
+            credentials: effectiveCredentials,
             redirect: schema.opts.follow_redirect ? "follow" : "manual",
             cache: 'no-cache',
             keepalive: true,
@@ -588,26 +728,20 @@ export class ptk_request {
         let self = this
 
 
-        return fetch(schema.request.url, params).then(async function (response) {
+        const runRequest = async () => {
+            const isJwt1 = schema?.metadata?.id === 'jwt_1'
+            if (useDnr && effectiveHeaders.length > 0) {
+                ruleId = parseInt((Math.floor(Math.random() * 6) + 1) + Math.floor((Date.now() * Math.random() * 1000)).toString().substr(-8, 8))
+                await ptk_ruleManager.addSessionRule(schema, ruleId)
+            }
+            return fetch(schema.request.url, params).then(async function (response) {
             let rh = []
             for (var pair of response.headers.entries()) {
                 rh.push({ name: pair[0], value: pair[1] })
             }
             let trackingRequest = null
-            if (self.trackingRequest) {
-                //trackingRequest = {}
-                for (let key of self.trackingRequest.keys()) {
-                    if (key != 'originalHeaders') {
-                        trackingRequest = self.trackingRequest.get(key)
-                        break
-                    }
-                }
-                // for (let value of self.trackingRequest.values()) {
-                //     trackingRequest = value
-                //     break
-                // }
-                if (!response.redirected && trackingRequest)
-                    rbSchema.request.headers = trackingRequest.request.requestHeaders
+            if (self.trackingRequest && rbSchema?.opts?.ptk_req_id) {
+                trackingRequest = self.trackingRequest.get(`ptk:${rbSchema.opts.ptk_req_id}`) || null
             }
 
             rbSchema.response.body = await response.text()
@@ -623,7 +757,6 @@ export class ptk_request {
             }
             const endTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
             rbSchema.response.timeMs = Math.round(endTime - startTime)
-
             return rbSchema
         }).catch(e => {
             console.warn('ptk_request.sendRequest failed', {
@@ -647,6 +780,12 @@ export class ptk_request {
             }
 
         })
+        }
+
+        if (useDnr) {
+            return ptk_request._withDnrLock(runRequest)
+        }
+        return runRequest()
     }
 
     _ensureContentLength(schema, headersMap, body) {

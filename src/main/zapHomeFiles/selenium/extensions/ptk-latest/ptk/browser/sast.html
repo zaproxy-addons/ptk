@@ -44,51 +44,51 @@
 </head>
 
 <body>
-  <div id="mainMenuWrapper">
-    <div class="ui segment clearing info_tab">
-      <div style="padding-top: 5px; padding-right: 4px;">
-        <div class="ui small button generate_report" style="display: none;margin-left: -11px;">Generate
-          report</div>
-        <!-- <div class="ui small secondary button save_scan" style="display: none; position: relative">Save
-          scan<i class="right floated cloud upload icon" style="padding-left: 8px;"></i>
-          <div style="position:absolute; top:0px;right: 0px">
-            <div class="ui  centered inline inverted loader"></div>
-          </div>
-        </div> -->
-
-        <!-- <div class="ui small secondary button exchange" style="display: none; position: relative">
-                    Import/Export<i class="right floated exchange icon" style="padding-left: 8px;"></i>
-                    <div style="position:absolute; top:0px;right: 0px">
-                        <div class="ui  centered inline inverted loader"></div>
-                    </div>
-                </div> -->
-
-        <div class="ui mini message scan_info" style="display: none">
-          <div class="ui header">Scanning <span id="scanning_url"></span></div>
+  <div class="ui segment clearing info_tab">
+    <div style="padding-top: 5px; padding-right: 4px;">
+      <div class="ui small button generate_report" style="display: none;margin-left: -11px;">Generate
+        report</div>
+      <!-- <div class="ui small secondary button save_scan" style="display: none; position: relative">Save
+        scan<i class="right floated cloud upload icon" style="padding-left: 8px;"></i>
+        <div style="position:absolute; top:0px;right: 0px">
+          <div class="ui  centered inline inverted loader"></div>
         </div>
-        <!-- <div class="ui mini right floated icon button " ><i class="settings rattacker large icon"
-                    title="Settings"></i></div> -->
-        <div class="ui mini right floated icon button"><i class="trash all alternate large icon reset" title="Reset"></i>
-        </div>
-        <!-- <div class="ui mini right floated icon button cloud_download_scans"><i class="cloud download alternate large icon" title="Download from cloud"></i>
-        </div> -->
-        <div class="ui mini right floated icon button import_export"><i class="exchange alternate large icon" title="Import/Export"></i>
-        </div>
+      </div> -->
 
-        <div class="ui secondary small right floated button run_scan_runtime" id="run_scan_bg_control">Scan in
-          runtime</div>
-        <div class="ui secondary small right floated button stop_scan_runtime" id="stop_scan_bg_control" style="display:none">Stop runtime scan</div>
+      <!-- <div class="ui small secondary button exchange" style="display: none; position: relative">
+                  Import/Export<i class="right floated exchange icon" style="padding-left: 8px;"></i>
+                  <div style="position:absolute; top:0px;right: 0px">
+                      <div class="ui  centered inline inverted loader"></div>
+                  </div>
+              </div> -->
+
+      <div class="ui mini message scan_info" style="display: none">
+        <div class="ui header">Scanning <span id="scanning_url"></span></div>
       </div>
-    </div>
+      <!-- <div class="ui mini right floated icon button " ><i class="settings rattacker large icon"
+                  title="Settings"></i></div> -->
+      <div class="ui mini right floated icon button"><i class="trash all alternate large icon reset" title="Reset"></i>
+      </div>
+      <!-- <div class="ui mini right floated icon button cloud_download_scans"><i class="cloud download alternate large icon" title="Download from cloud"></i>
+      </div> -->
+      <div class="ui mini right floated icon button import_export"><i class="exchange alternate large icon" title="Import/Export"></i>
+      </div>
 
+      <div class="ui secondary small right floated button run_scan_runtime" id="run_scan_bg_control">Scan in
+        runtime</div>
+      <div class="ui secondary small right floated button stop_scan_runtime" id="stop_scan_bg_control" style="display:none">Stop runtime scan</div>
+    </div>
   </div>
-  <div id="pagecontent" style="padding-top:80px;">
-    <div id="main">
-      <table class="ui tiny table" style="padding: 0px;margin: 0px;border: none;">
+  <div id="pagecontent">
+    <div id="sast_page_loader" class="ui active inverted dimmer" style="display:block; position: fixed; top: 46px; left: 0; width: 100%; height: 100%; z-index: 2;">
+      <div class="ui massive text loader">Loading</div>
+    </div>
+    <div id="main" style="display:none;height: 100%;height:100%;width: 100%;position: fixed; top: 46px;z-index: 1;">
+      <table class="ui tiny table" style="padding: 0px;margin: 0px;border: none;height: 100%;">
         <tbody>
           <tr>
             <td style="min-width:50px; vertical-align: text-top; padding: 0px;">
-              <div class="eight wide field" style="padding-right: 1px;">
+              <div class="eight wide field" style="padding-right: 1px;height: 91vh;">
                 <div class="field rattacker" style="scrollbar-width: none;height: 100% !important;min-height: 85vh; position: relative;">
                   <div class="field" style="border:none;scrollbar-width: none;position: absolute;height: 100%;width: 100%;">
                     <div class="ui items styled accordion" id="request_info" style="width: 100%; overflow: scroll;position:absolute; margin: 0px;scrollbar-width: none;">
@@ -114,9 +114,9 @@
               </div>
             </td>
             <td style="width:50%;margin: 0px; padding: 0px 0px 0px 2px;border: none;vertical-align: top;">
-              <div class="eight wide field" style="padding-left: 1px;">
+              <div class="eight wide field" style="padding-left: 1px;height: 91vh;">
                 <div class="field rattacker" style="scrollbar-width: none;height: 100% !important;min-height: 85vh;">
-                  <div class="ui tiny message" style="position: sticky;top: 0px;z-index: 1; min-height: 80px;padding-top:15px; width: 100%;">
+                  <div class="ui tiny message" style="position: sticky;top: 0px;z-index: 1; min-height: 80px;padding:0px">
                     <div class="ui small icon buttons" style="position: absolute;top: 0px;left: 0px;width: 100%;">
 
                       <div class="field" style="width: 100%;">
@@ -131,7 +131,7 @@
                       </div>
                     </div>
                     <br />
-                    <div class="ui mini statistics ptk-summary-stats" style="margin-top: 5px; display: inline-block;position: absolute;left: 20px;">
+                    <div class="ui mini statistics ptk-summary-stats" style="margin-top: 20px; display: inline-block;position: absolute;left: 20px;">
                       <div class="statistic">
                         <div class="label">Rules</div>
                         <div class="value" id="sast_attacks_count">0</div>
@@ -142,25 +142,25 @@
                       </div>
                     </div>
 
-                    <div class="ui mini statistics ptk-severity-stats" style="margin-top:5px;display: inline-block; position: absolute;right: 20px;">
+                    <div class="ui mini statistics ptk-severity-stats" style="margin-top:20px;display: inline-block; position: absolute;right: 20px;">
                       <div class="statistic">
-                        <div class="label"><i class="fire red icon"></i>Critical</div>
+                        <div class="label"><i class="fire ptk-sev-critical icon"></i>Critical</div>
                         <div class="value" id="sast_critical_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="exclamation triangle red icon"></i>High</div>
+                        <div class="label"><i class="exclamation triangle ptk-sev-high icon"></i>High</div>
                         <div class="value" id="sast_high_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="exclamation triangle orange icon"></i>Medium</div>
+                        <div class="label"><i class="exclamation triangle ptk-sev-medium icon"></i>Medium</div>
                         <div class="value" id="sast_medium_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="exclamation triangle yellow icon"></i>Low</div>
+                        <div class="label"><i class="exclamation triangle ptk-sev-low icon"></i>Low</div>
                         <div class="value" id="sast_low_count">0</div>
                       </div>
                       <div class="statistic">
-                        <div class="label"><i class="info circle blue icon"></i>Info</div>
+                        <div class="label"><i class="info circle ptk-sev-info icon"></i>Info</div>
                         <div class="value" id="sast_info_count">0</div>
                       </div>
                     </div>
@@ -190,7 +190,7 @@
 
                         </div>
                         <div class="ui mini statistic right floated" style="margin-top: 5px;">
-                            <div class="label"><i class="info circle blue icon"></i>
+                            <div class="label"><i class="info circle ptk-sev-info icon"></i>
                                 Info
                             </div>
                             <div class="value" id="sast_info_count">
@@ -198,7 +198,7 @@
                             </div>
                         </div>
                         <div class="ui mini statistic right floated" style="margin-top: 5px;">
-                            <div class="label"><i class="exclamation triangle yellow icon"></i>
+                            <div class="label"><i class="exclamation triangle ptk-sev-low icon"></i>
                                 Low
                             </div>
                             <div class="value" id="sast_low_count">
@@ -206,7 +206,7 @@
                             </div>
                         </div>
                         <div class="ui mini statistic right floated" style="margin-top: 5px;">
-                            <div class="label"><i class="exclamation triangle orange icon"></i>
+                            <div class="label"><i class="exclamation triangle ptk-sev-medium icon"></i>
                                 Medium
                             </div>
                             <div class="value" id="sast_medium_count">
@@ -214,7 +214,7 @@
                             </div>
                         </div>
                         <div class="ui mini statistic right floated" style="margin-top: 5px;">
-                            <div class="label"><i class="exclamation triangle red icon"></i>
+                            <div class="label"><i class="exclamation triangle ptk-sev-high icon"></i>
                                 High
                             </div>
                             <div class="value" id="sast_high_count">
@@ -222,7 +222,7 @@
                             </div>
                         </div>
                         <div class="ui mini statistic right floated" style="margin-top: 5px;">
-                            <div class="label"><i class="fire red icon"></i>
+                            <div class="label"><i class="fire ptk-sev-critical icon"></i>
                                 Critical
                             </div>
                             <div class="value" id="sast_critical_count">
@@ -238,50 +238,39 @@
             </div>
 -->
 
-      <div style="height: 100%;display:none" id="welcome_message">
-        <div class="ui message" style="height:100%;width: 100%;position: fixed; top: 80px;z-index: 1;">
-
-
-          <div class="content" style="padding-bottom: 10px;">
-            SAST, or Static Application Security Testing, is a white-box testing method that analyzes source
-            code, bytecode, or binary code for vulnerabilities without executing the application.
-            By scanning JS source files (including ES modules, frameworks like React/Vue, and embedded
-            scripts in HTML), OWASP PTK will identify injection flaws, insecure data
-            handling and DOM-based XSS before code ever reaches QA or production.
-          </div>
-          <div class="header">How to scan an application:</div>
-          <div class="content" style="margin-top: -15px;">
-            <ul>
-              <li>Click the "Scan in runtime" button and confirm it's starting
-              </li>
-              <li>Start browsing the application you are scanning, eg click on
-                different
-                links, submit forms, etc</li>
-              <li>Once completed open SAST scanner and stop the scan</li>
-              <li>Check the result</li>
-            </ul>
-          </div>
-
-          <div class="content" style="margin-top: 8px; height: 52%; overflow: auto;">
-            <table id="sast_rules_table" class="ui celled table small responsive nowrap unstackable" width="100%">
-              <thead>
-                <tr>
-                  <th style="width: 50%;">Rule</th>
-                  <th style="width: 35%;">Module</th>
-                  <th style="width: 15%;">Severity</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-
-        </div>
-
-
-      </div>
-
     </div>
 
+  </div>
+
+  <div id="welcome_message" class="ptk-welcome" style="display:none;">
+    <div class="ui message ptk-welcome-msg">
+      <div class="ptk-welcome-top">
+        <div class="content ptk-welcome-desc">
+          SAST, or Static Application Security Testing, is a white-box testing method that analyzes source code, bytecode, or binary code for vulnerabilities without executing the application. By scanning JS source files (including ES modules, frameworks like React/Vue, and embedded scripts in HTML), OWASP PTK will identify injection flaws, insecure data handling and DOM-based XSS before code ever reaches QA or production.
+        </div>
+        <div class="header">How to scan an application:</div>
+        <div class="content ptk-welcome-steps">
+          <ul>
+            <li>Click the "Scan in runtime" button and confirm it's starting</li>
+            <li>Start browsing the application you are scanning, e.g. click on different links, submit forms, etc.</li>
+            <li>Once completed open SAST scanner and stop the scan</li>
+            <li>Check the result</li>
+          </ul>
+        </div>
+      </div>
+      <div class="ptk-welcome-tablewrap" style="scrollbar-width: none;">
+        <table id="sast_rules_table" class="ui celled table small responsive nowrap unstackable" width="100%">
+          <thead>
+            <tr>
+              <th style="width: 50%;">Rule</th>
+              <th style="width: 35%;">Module</th>
+              <th style="width: 15%;">Severity</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <!-- Attack details and showHtml support -->
@@ -366,7 +355,7 @@
     </div>
   </div>
 
-  <div id="run_scan_dlg" class="ui fullscreen modal coupled second" style="display: none;">
+  <div id="run_scan_dlg" class="ui small modal coupled second" style="display: none;">
     <i class="close icon"></i>
     <div class="header">Confirm scan execution</div>
 
@@ -374,17 +363,45 @@
       <div class="ui message" style="margin: -20px -20px 0px -20px;">
         <p>Are you sure you want to run SAST scan against <span id="scan_host" style="font-weight: 600;"></span>?</p>
       </div>
+      <div id="ptk_scan_reload_warning" class="ui warning message ptk-reload-warning ptk-reload-warning-sast">
+        <i id="ptk_scan_reload_warning_close_sast" class="close icon"></i>
+        Reload this tab to enable runtime signals required for SAST.
+      </div>
+      <div class="ui form" id="sast_scans_form" style="margin-top: 12px;">
+        <div class="field">
+          <label>Scan strategy:</label>
+          <i class="question circle icon" style='cursor:pointer;position: absolute;top:0px;left: 85px;'></i>
+          <div class="ui fluid popup bottom right transition hidden" style="min-width: 350px;">
+            <strong>Scan strategy:</strong> <br />
+            <ul>
+              <li>All rules (recommended) – run both taint-flow and pattern rules.</li>
+              <li>Taint flow – only taint-based rules (faster, fewer findings).</li>
+            </ul>
+          </div>
+          <select id="sast-scan-strategy" class="ui dropdown" style="width: 100%;">
+            <option value="0">All rules (recommended)</option>
+            <option value="1">Taint flow rules</option>
+          </select>
+        </div>
+      </div>
 
     </div>
+    <!-- 
     <div class="ui fluid selection dropdown">
-      <input type="hidden" name="policy" id="policy">
+      <input type="hidden" name="scanStrategy" id="sast-scan-strategy">
       <i class="dropdown icon"></i>
-      <div class="default text">Scan policy</div>
+      <div class="default text">Scan strategy</div>
       <div class="menu">
         <div class="item" data-value="0">All rules</div>
         <div class="item" data-value="1">Taint flow rules</div>
       </div>
     </div>
+    <div class="ui form" style="margin-top: 12px;">
+      <div class="field">
+        <label>Pages to analyze (comma or newline separated)</label>
+        <textarea id="sast_pages" rows="3" placeholder="http://localhost:3001/#/search?q=test"></textarea>
+      </div>
+    </div> -->
     <br />
     <div class="actions">
       <div class="ui cancel button">Cancel</div>

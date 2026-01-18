@@ -3,6 +3,8 @@
 
 const dashboardText = `Reload the tab to activate tracking &nbsp;<i class="exclamation red circle icon" style="font-size: 1em; margin-bottom: 1px;"></i>`
 
+
+
 function bindTable(id, params) {
     params.paging = false
     params.ordering = false
@@ -10,24 +12,47 @@ function bindTable(id, params) {
     params.searching = params.searching ? params.searching : false
     params.sorting = false
     params.dom = 'frtip'
-    //params.buttons = [ 'copyHtml5', 'excelHtml5', 'pdfHtml5', 'csvHtml5' ]
-
+    // Enable deferred rendering for better performance with large datasets
+    params.deferRender = true
 
     let table
     if ($.fn.dataTable.isDataTable(id)) {
         table = $(id).DataTable()
-        table.clear().rows.add(params.data).draw()
+
+        // Support incremental updates if keyColumn is specified
+        // This avoids destroying and rebuilding the entire table
+        if (params.incremental && params.keyColumn !== undefined && Array.isArray(params.data)) {
+            const existingKeys = new Set()
+            table.rows().every(function() {
+                const data = this.data()
+                if (data && data[params.keyColumn] !== undefined) {
+                    existingKeys.add(data[params.keyColumn])
+                }
+            })
+
+            // Only add rows that don't exist yet
+            const newRows = params.data.filter(row =>
+                row && !existingKeys.has(row[params.keyColumn])
+            )
+
+            if (newRows.length > 0) {
+                table.rows.add(newRows).draw(false) // false = maintain scroll position
+            }
+        } else {
+            // Full rebuild (existing behavior)
+            table.clear().rows.add(params.data).draw()
+        }
     } else {
         table = $(id).DataTable(params)
-        // if (params.buttons) {
-        //     table.buttons().container()
-        //         .appendTo($('.col-sm-6:eq(0)', table.table().container()));
-        // }
     }
     return table
 }
 
 jQuery(function () {
+
+    const isIframePage = !document.getElementById('mainMenuWrapper')
+
+    // (debug nav links removed)
 
 
     // $('.ui.sidebar')
@@ -36,95 +61,11 @@ jQuery(function () {
 
 
 
-    let version = browser.runtime.getManifest().version
-    //Main menu
-    $('#mainMenuWrapper').prepend(
-        `<div class="ui small inverted borderless menu" style="height:12px">
-            
-            <div class="ui container" id="mainMenu">
-                <a class="item" href="index.html" data-history="index"><img src="assets/images/hacker_w1.png" id="ptkicon" title="OWASP Penetration Testing Kit">
-                
-                <i class="home icon" style="position: relative;top: -10px;padding: 0px;margin: -5px;"></i></a>
-                <a class="item" href="rattacker.html" data-history="rattacker">DAST</a>
-                <a class="item" href="iast.html" data-history="iast">IAST</a>
-                <a class="item" href="sast.html" data-history="sast">SAST</a>
-                <a class="item" href="sca.html" data-history="sca">SCA</>
-                <a class="item" href="proxy.html" data-history="proxy">Proxy</a>
-                <a class="item" href="rbuilder.html" data-history="rbuilder">R-Builder</a>
-                <a class="item" href="session.html" data-history="session">Cookies</a>
-                <a class="item" href="jwt.html" data-history="jwt">JWT</a>
-                <a class="item" href="decoder.html" data-history="decoder">Decoder</a>
 
-                <div class="ui top left pointing dropdown item" style="margin-right: 0px !important;">Cheat sheets</i>
-                    <div class="menu" style="width: 120px;top: 25px;">
-                        <a class="item" href="xss.html" data-history="xss">XSS</a>
-                        <a class="item" href="sql.html" data-history="sql">SQL</a>
-                    </div>
-                </div>
 
-                <div class="ui top left pointing dropdown item" >Tools<i class="dropdown icon"></i>
-                    <div class="menu" style="width: 120px;top: 25px;">
-                    
-                    <a class="item" href="recording.html" data-history="recording">Macro</a>
 
-                    <a class="item" href="swagger-editor.html" data-history="swagger-editor">Swagger</a>
-
-                    <!--a class="item" href="portscanner.html" data-history="portscanner">Port Scanner</a-->
-                    </div>
-                </div>
-                <div style="position: absolute;width: 30px;height: 30px;right: 47px;top: -6px;"> 
-                <a class="item" href="https://athenaos.org/en/resources/browser-pentesting/#_top" target="_blank"><img src="assets/images/athenaos.svg" id="AthenaOS" title="Athena OS Integration"></a>
-                </div>
-    
-                
-                <!--div class="ui dropdown item " style="position: absolute;width: 30px;height: 30px;right: 34px;top: 3px;padding: 0px; ">
-                    <i title="Profile" id="profile"></i>
-                </div-->
-                <div class="ui dropdown item notifications" style="position: absolute;width: 30px;height: 30px;right: 34px;top: 3px;padding: 0px; display:none">
-                    <div><i title="Notifications" class=" red exclamation triangle big icon"></i></div>
-                    <div class="menu">
-                    <div class="ui error message" style="margin-top: 0px !important;">
-                      <div class="header">Error</div>
-                      <p>Cookie and storage access is disabled. Reinstall the extension or enable cookie/storage on the "Settings" page.</p>
-                    </div>
-                  </div>
-                </div>
-
-                <!--div class="ui dropdown item " style="position: absolute;width: 30px;height: 30px;right: 34px;top: 3px;padding: 0px; ">
-                    <div><i title="Open in new window" class="external square alternate big icon" id="opennewwindow"></i></div>
-                </div-->
-
-                
-                <div class="ui dropdown item" style="position: absolute;width: 30px;height: 30px;right: 3px;top: 3px;padding: 0px;">
-                    <div ><i title="More" class="question circle outline big icon"></i></div>
-                    <div class="menu top_right_icon" style="margin-top: 0px !important; min-height: 90px;top: 34px;">
-                        <div class="ui fitted divider" style="margin-top: 0px;"></div>
-                        <a class="item" href="#" id="opensettings">Settings</a>
-                        <div class="ui fitted divider"></div>
-                        
-                        <a class="item" href="#" id="reloadextension">Reload PTK</a>
-                        <div class="ui fitted divider"></div>
-                        <a class="item" href="https://pentestkit.co.uk/howto.html" target="_blank">How to<i class="external square right floated icon"></i></a>
-                        <a class="item" href="https://pentestkit.co.uk/release_notes.html" target="_blank">Release notes<i class="external square right floated icon"></i></a>
-                        <div class="ui fitted divider"></div>
-                        <a class="item" href="#" id="credits">Credits</a>
-                        <a class="item" href="#" id="disclaimer">Disclaimer</a>
-                        <a class="item" href="#" id="privacy">Privacy Policy</a>
-                        <a class="item" href="#" id="contactus">Contact Us</a>
-                        <div class="ui fitted divider"></div>
-                        <a class="item disabled" href="#">Version: #${version}</a>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div id='ptk_popup_dialog' class='ui fullscreen modal'>
-        <i class="close icon" style="right: 2px;top: 2px;"></i>
-        <iframe style="width:100%; height:100%; border:none; margin:0; padding:0; overflow:hidden; z-index:999999;"></iframe>
-        </div>
-        `
-    )
-
-    $('#footer_menu').prepend(
+    if (!isIframePage) {
+        $('#footer_menu').prepend(
         `
         <div class=""
             style="position: fixed; bottom: -6px;  z-index:1; ">
@@ -189,110 +130,69 @@ jQuery(function () {
 
 
         `
-    )
-
-    $("body").prepend(
-        `
-        <div class="ui success tiny message" id="ptk_release_note" style="display:none;position: absolute;bottom: 0;right: 0;z-index: 2;margin:0; width:500px">
-            <i class="close icon ptk_release_note"></i>
-            <div class="header">
-                Release notes - #${version}
-            </div>
-            <ul class="list">
-            <li><strong>CVE lookup:</strong> Introduced a new CVE Lookup module for passive CVE checks, and added 10 new CVEs supported in both passive lookup and DAST attack modules.</li>
-            <li><strong>IAST improvements:</strong> Enhanced IAST functionality with <code>chrome.debugger</code> support to improve request/response visibility, correlation, and coverage in complex browser-driven flows.</li>
-            <li><strong>UI &amp; stability:</strong> Delivered UI improvements and bug fixes across the extension to improve usability, performance, and overall reliability.</li>
-            </ul>
-            <p>More details on <a href="https://pentestkit.co.uk/release_notes.html" target="_blank">https://pentestkit.co.uk/release_notes.html</a></p>
-        </div>
-        `
-
-    )
-
-
-
-
-    if (window.opener) {
-        $('#opennewwindow').hide()
+        )
     }
 
-    $('#mainMenu a.item').each(function (i, obj) {
-        if (window.location.pathname.indexOf($(obj).attr('href')) > 0)
-            $(obj).addClass('active').siblings().removeClass('active')
-    });
 
-    $('#mainMenu a.item').on('click', function () {
-        let route = $(this).attr('data-history')
-        if (route) {
+
+
+
+
+    if (!isIframePage) {
+        if (window.opener) {
+            $('#opennewwindow').hide()
+        }
+
+        //Settings page
+        $('#opensettings').on('click', function () {
+            $('#ptk_popup_dialog iframe').attr('src', 'settings.html')
+            $('#ptk_popup_dialog').modal('show')
+        })
+
+        //Privacy page
+        $('#privacy').on('click', function () {
+            $('#ptk_popup_dialog iframe').attr('src', 'privacy.html')
+            $('#ptk_popup_dialog').modal('show')
+        })
+
+        //Contact page
+        $('#contactus').on('click', function () {
+            $('#ptk_popup_dialog iframe').attr('src', 'contact.html')
+            $('#ptk_popup_dialog').modal('show')
+        })
+
+        //Disclaimer page
+        $('#disclaimer').on('click', function () {
+            $('#ptk_popup_dialog iframe').attr('src', 'disclaimer.html')
+            $('#ptk_popup_dialog').modal('show')
+        })
+
+        //Credits page
+        $('#credits').on('click', function () {
+            $('#ptk_popup_dialog iframe').attr('src', 'credits.html')
+            $('#ptk_popup_dialog').modal('show')
+        })
+
+        //Profile page
+        $('#profile').on('click', function () {
+            $('#ptk_popup_dialog iframe').attr('src', 'profile.html')
+            $('#ptk_popup_dialog').modal('show')
+        })
+
+        //New window
+        $('#opennewwindow').on('click', function () {
+            browser.windows.create({ url: window.location.href, type: "popup", width: 900, height: 650 })
+            window.close();
+        });
+
+        //Reload
+        $('#reloadextension').on('click', function () {
             browser.runtime.sendMessage({
                 channel: "ptk_popup2background_app",
-                type: "history",
-                route: route,
-                hash: ""
-            })
-        }
-    })
-
-    //Submenu all pages
-    $('.ui.menu a.item').on('click', function () {
-        $(this).addClass('active').siblings().removeClass('active')
-        let forItem = $(this).attr('forItem')
-        $('.ui.menu a.item').each(function (i, obj) {
-            let f = $(obj).attr('forItem')
-            if (f != forItem) $('#' + f).hide()
-        })
-        $('#' + forItem).fadeIn("slow")
-    })
-
-    //Settings page
-    $('#opensettings').on('click', function () {
-        $('#ptk_popup_dialog iframe').attr('src', 'settings.html')
-        $('#ptk_popup_dialog').modal('show')
-    })
-
-    //Privacy page
-    $('#privacy').on('click', function () {
-        $('#ptk_popup_dialog iframe').attr('src', 'privacy.html')
-        $('#ptk_popup_dialog').modal('show')
-    })
-
-    //Contact page
-    $('#contactus').on('click', function () {
-        $('#ptk_popup_dialog iframe').attr('src', 'contact.html')
-        $('#ptk_popup_dialog').modal('show')
-    })
-
-    //Disclaimer page
-    $('#disclaimer').on('click', function () {
-        $('#ptk_popup_dialog iframe').attr('src', 'disclaimer.html')
-        $('#ptk_popup_dialog').modal('show')
-    })
-
-    //Credits page
-    $('#credits').on('click', function () {
-        $('#ptk_popup_dialog iframe').attr('src', 'credits.html')
-        $('#ptk_popup_dialog').modal('show')
-    })
-
-    //Profile page
-    $('#profile').on('click', function () {
-        $('#ptk_popup_dialog iframe').attr('src', 'profile.html')
-        $('#ptk_popup_dialog').modal('show')
-    })
-
-    //New window
-    $('#opennewwindow').on('click', function () {
-        browser.windows.create({ url: window.location.href, type: "popup", width: 900, height: 650 })
-        window.close();
-    });
-
-    //Reload
-    $('#reloadextension').on('click', function () {
-        browser.runtime.sendMessage({
-            channel: "ptk_popup2background_app",
-            type: "reloadptk"
-        }).catch(e => e)
-    });
+                type: "reloadptk"
+            }).catch(e => e)
+        });
+    }
 
     //Semantic UI 
     $('.ui.dropdown').dropdown({ on: 'click' })
@@ -302,23 +202,25 @@ jQuery(function () {
             allowAdditions: true
         })
 
-    setTimeout(function () {
-        browser.runtime.sendMessage({
-            channel: "ptk_popup2background_app",
-            type: "release_note"
-        }).then(response => {
-            if (response?.show) {
-                $('#ptk_release_note').show()
-            }
-        })
-    }, 300)
+    if (!isIframePage) {
+        setTimeout(function () {
+            browser.runtime.sendMessage({
+                channel: "ptk_popup2background_app",
+                type: "release_note"
+            }).then(response => {
+                if (response?.show) {
+                    $('#ptk_release_note').show()
+                }
+            })
+        }, 300)
 
-    $('.close.icon.ptk_release_note').on('click', function () {
-        $('#ptk_release_note').hide()
-        browser.runtime.sendMessage({
-            channel: "ptk_popup2background_app",
-            type: "release_note_read"
+        $('.close.icon.ptk_release_note').on('click', function () {
+            $('#ptk_release_note').hide()
+            browser.runtime.sendMessage({
+                channel: "ptk_popup2background_app",
+                type: "release_note_read"
+            })
         })
-    })
+    }
 
 })

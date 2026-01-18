@@ -15,6 +15,45 @@ const sastFilterState = {
 const RULE_FILTER_ALL_VALUE = "__sast_all_rules__";
 const RULE_FILTER_DROPDOWN_SELECTOR = "#rule_filter_dropdown";
 let isRuleDropdownSyncing = false;
+const SAST_DELTA_QUEUE = [];
+const SAST_FLUSH_INTERVAL_MS = 300;
+let sastFlushTimer = null;
+const SAST_BUCKET_ORDER = ["critical", "high", "medium", "low", "info"];
+
+function normalizeSastSeverityKey(value) {
+  const key = String(value || "").toLowerCase();
+  if (key === "critical" || key === "high" || key === "medium" || key === "low" || key === "info") {
+    return key;
+  }
+  if (key === "informational") return "info";
+  return "info";
+}
+
+function getSastBucket(item) {
+  const severity = item?.metadata?.severity || item?.severity || "";
+  return normalizeSastSeverityKey(severity);
+}
+
+function buildSastBucketHtml() {
+  return SAST_BUCKET_ORDER
+    .map((bucket) => `<div class="sast_bucket" data-bucket="${bucket}"></div>`)
+    .join("");
+}
+
+function ensureSastBuckets() {
+  const $container = $("#attacks_info");
+  if ($container.find(".sast_bucket").length) return;
+  $container.html(buildSastBucketHtml());
+}
+
+function appendSastToBucket(attackHtml, bucketKey) {
+  if (!attackHtml) return;
+  ensureSastBuckets();
+  const selector = `.sast_bucket[data-bucket="${bucketKey}"]`;
+  const $bucket = $("#attacks_info").find(selector);
+  $bucket.addClass("has-items");
+  $bucket.append(attackHtml);
+}
 
 function hasRenderableSastData(scanResult) {
   if (!scanResult) return false;
@@ -47,6 +86,9 @@ function buildSastItemFromFinding(finding, index) {
   const loc = finding.location || {};
   const ev = (finding.evidence && finding.evidence.sast) || {};
   const severity = formatSeverityLabel(finding.severity);
+  const owaspArray = Array.isArray(finding.owasp) ? finding.owasp : [];
+  const owaspPrimary = finding.owaspPrimary || (owaspArray.length ? owaspArray[0] : null);
+  const owaspLegacy = finding.owaspLegacy || (owaspPrimary ? `${owaspPrimary.id}:${owaspPrimary.version}-${owaspPrimary.name}` : "");
   const ruleId = finding.ruleId || finding.id || `rule-${index}`;
   const description = finding.description || ev.description || "";
   const recommendation = finding.recommendation || ev.recommendation || "";
@@ -63,7 +105,9 @@ function buildSastItemFromFinding(finding, index) {
     name: finding.moduleName || null,
     severity,
     category: finding.category || null,
-    owasp: finding.owasp || null,
+    owasp: owaspArray,
+    owaspPrimary,
+    owaspLegacy,
     cwe: finding.cwe || null,
     tags: finding.tags || [],
     links: finding.links || {},
@@ -99,10 +143,14 @@ function buildSastItemFromFinding(finding, index) {
     pageCanon: loc.pageUrl || loc.url || null,
     metadata,
     module_metadata: moduleMeta,
+    owasp: owaspArray,
+    owaspPrimary,
+    owaspLegacy,
     source,
     sink,
     trace: ev.trace || finding.trace || [],
     nodeType: ev.nodeType || finding.nodeType || null,
+    confidence: Number.isFinite(finding.confidence) ? finding.confidence : null,
     requestId: index,
     type: "sast",
   };
@@ -136,7 +184,6 @@ function extractSastFindingsForStats(raw, vm) {
 function summarizeSastFindings(findings) {
   const summary = {
     findingsCount: 0,
-    vulnsCount: 0,
     rulesCount: 0,
     critical: 0,
     high: 0,
@@ -151,7 +198,6 @@ function summarizeSastFindings(findings) {
   findings.forEach((finding) => {
     if (!finding) return;
     summary.findingsCount += 1;
-    summary.vulnsCount += 1;
     const severity = String(finding?.severity || finding?.metadata?.severity || "").toLowerCase();
     if (severity === "critical") summary.critical += 1;
     else if (severity === "high") summary.high += 1;
@@ -559,7 +605,7 @@ jQuery(function () {
   $(document).on("click", ".run_scan_runtime", function () {
     controller
       .init()
-      .then(function (result) {
+      .then(async function (result) {
         if (!result?.activeTab?.url) {
           $("#result_header").text("Error");
           $("#result_message").text(
@@ -572,14 +618,32 @@ jQuery(function () {
         let h = new URL(result.activeTab.url).host;
         $("#scan_host").text(h);
         // $('#scan_domains').text(h)
+        window._ptkSastReloadWarningClosed = false;
+        let contentReady = true;
+        contentReady = await rutils.pingContentScript(result.activeTab.tabId, { timeoutMs: 700 });
+        if (!window._ptkSastReloadWarningClosed) {
+          $("#ptk_scan_reload_warning").toggle(!contentReady);
+        }
 
         $("#run_scan_dlg")
           .modal({
             allowMultiple: true,
             onApprove: function () {
-              let policy = $("#policy").val();
+              if (!contentReady) {
+                $("#ptk_scan_reload_warning").show();
+                return false;
+              }
+              let scanStrategy = $("#sast-scan-strategy").val();
+              if (scanStrategy === undefined || scanStrategy === null || scanStrategy === '') {
+                scanStrategy = 0;
+              }
+              const pagesRaw = $("#sast_pages").val() || "";
+              const pages = String(pagesRaw)
+                .split(/[\n,]+/)
+                .map((entry) => entry.trim())
+                .filter(Boolean);
               controller
-                .runBackroungScan(result.activeTab.tabId, h, policy)
+                .runBackroungScan(result.activeTab.tabId, h, scanStrategy, pages)
                 .then(function (result) {
                   $("#request_info").html("");
                   $("#attacks_info").html("");
@@ -589,10 +653,24 @@ jQuery(function () {
             },
           })
           .modal("show");
+        $('#sast_scans_form .question')
+          .popup({
+            inline: true,
+            hoverable: true,
+            delay: {
+              show: 300,
+              hide: 800
+            }
+          })
       })
       .catch((e) => e);
 
     return false;
+  });
+
+  $(document).on("click", "#ptk_scan_reload_warning_close_sast", function () {
+    window._ptkSastReloadWarningClosed = true;
+    $("#ptk_scan_reload_warning").hide();
   });
 
   $(document).on("click", ".stop_scan_runtime", function () {
@@ -644,9 +722,9 @@ jQuery(function () {
   });
 
   $(".export_scan_btn").on("click", function () {
-    controller.init().then(function (result) {
-      if (hasRenderableSastData(result.scanResult)) {
-        let blob = new Blob([JSON.stringify(result.scanResult)], {
+    controller.exportScanResult().then(function (scanResult) {
+      if (scanResult && hasRenderableSastData(scanResult)) {
+        let blob = new Blob([JSON.stringify(scanResult)], {
           type: "text/plain",
         });
         let fName = "PTK_SAST_scan.json";
@@ -656,7 +734,11 @@ jQuery(function () {
         downloadLink.innerHTML = "Download File";
         downloadLink.href = window.URL.createObjectURL(blob);
         downloadLink.click();
+      } else {
+        showSastResultModal('Error', 'Nothing to export yet.')
       }
+    }).catch(err => {
+      showSastResultModal('Error', err?.message || 'Unable to export scan')
     });
   });
 
@@ -828,7 +910,7 @@ jQuery(function () {
   $(document).on("bind_stats", function (e, scanResult) {
     if (scanResult?.stats) {
       rutils.bindStats(scanResult.stats, "sast");
-      if (scanResult.stats.vulnsCount > 0) {
+      if ((scanResult.stats.findingsCount || 0) > 0) {
         $("#filter_vuln").trigger("click");
       }
     }
@@ -854,8 +936,14 @@ jQuery(function () {
   };
 
   controller.init().then(function (result) {
+    const initCount = Array.isArray(result?.scanResult?.findings) ? result.scanResult.findings.length : 0;
     changeView(result);
-    if (hasRenderableSastData(result.scanResult)) {
+    if (result.isScanRunning) {
+      showRunningForm(result);
+      if (hasRenderableSastData(result.scanResult)) {
+        bindScanResult(result);
+      }
+    } else if (hasRenderableSastData(result.scanResult)) {
       bindScanResult(result);
     } else if (Array.isArray(result?.default_modules) && result.default_modules.length) {
       bindModules(result);
@@ -867,15 +955,20 @@ jQuery(function () {
 });
 
 function showWelcomeForm() {
+  setSastPageLoader(false);
+  $("#main").hide();
   $("#welcome_message").show();
   $("#run_scan_bg_control").show();
 }
 
 function hideWelcomeForm() {
   $("#welcome_message").hide();
+  $("#main").show();
 }
 
 function showRunningForm(result) {
+  setSastPageLoader(false);
+  $("#main").show();
   $("#scanning_url").text(result.scanResult.host);
   $(".scan_info").show();
   $("#stop_scan_bg_control").show();
@@ -888,11 +981,19 @@ function hideRunningForm() {
 }
 
 function showScanForm(result) {
+  setSastPageLoader(false);
+  $("#main").show();
   $("#run_scan_bg_control").show();
 }
 
 function hideScanForm() {
   $("#run_scan_bg_control").hide();
+}
+
+function setSastPageLoader(show) {
+  const $loader = $("#sast_page_loader");
+  if (!$loader.length) return;
+  $loader.toggle(!!show);
 }
 
 function changeView(result) {
@@ -923,26 +1024,26 @@ $(document).on("click", ".attack_details", function () {
 })
 
 function bindRequest(info) {
-    const raw = info === undefined || info === null ? "" : String(info);
-    const escapedRaw = ptk_utils.escapeHtml(raw);
-    const canon = typeof rutils?.canonicalizeSastFileId === "function"
-        ? rutils.canonicalizeSastFileId(raw)
-        : raw;
-    const escapedCanon = ptk_utils.escapeHtml(canon || "");
-    let item = `
+  const raw = info === undefined || info === null ? "" : String(info);
+  const escapedRaw = ptk_utils.escapeHtml(raw);
+  const canon = typeof rutils?.canonicalizeSastFileId === "function"
+    ? rutils.canonicalizeSastFileId(raw)
+    : raw;
+  const escapedCanon = ptk_utils.escapeHtml(canon || "");
+  let item = `
                 <div>
                 <div class="title short_message_text" data-file="${escapedRaw}" data-file-canon="${escapedCanon}" style="overflow-y: hidden;height: 34px;background-color: #eeeeee;margin:1px 0 0 0;cursor:pointer; position: relative">
                     ${escapedRaw}<i class="filter icon" style="float:right; position: absolute; top: 3px; right: -3px;" title="Filter by request"></i>
                     
                 </div>
                 `
-    return item
+  return item
 }
 
 function bindScanResult(result) {
   if (!result.scanResult) return;
   const raw = result.scanResult || {};
-  const vm = normalizeScanResult(raw);
+  const vm = raw.__normalized ? raw : normalizeScanResult(raw);
   controller.scanResult = result;
   controller.scanViewModel = vm;
   $("#progress_message").hide();
@@ -951,6 +1052,14 @@ function bindScanResult(result) {
   $("#request_info").html("");
   $("#attacks_info").html("");
   hideWelcomeForm();
+  SAST_DELTA_QUEUE.length = 0;
+  if (sastFlushTimer) {
+    clearTimeout(sastFlushTimer);
+    sastFlushTimer = null;
+  }
+  controller._sastKnownFilesCanon = new Set();
+  controller._sastKnownRuleIds = new Set();
+  controller._sastRuleCounts = new Map();
 
   const findings = Array.isArray(vm.findings) ? vm.findings : [];
   const legacyItems = normalizeLegacySastItems(raw.items);
@@ -969,10 +1078,16 @@ function bindScanResult(result) {
     .filter((item, i, ar) => ar.indexOf(item) === i)
     .filter((item) => item && !/^inline/i.test(item));
 
+  const requestMarkup = [];
   files.forEach((file) => {
     if (!file) return;
-    $("#request_info").append(bindRequest(file));
+    const canon = typeof rutils?.canonicalizeSastFileId === "function"
+      ? rutils.canonicalizeSastFileId(file)
+      : file;
+    if (canon) controller._sastKnownFilesCanon.add(canon);
+    requestMarkup.push(bindRequest(file));
   });
+  $("#request_info").html(requestMarkup.join(""));
 
   let attackItems = [];
   if (findings.length) {
@@ -989,19 +1104,46 @@ function bindScanResult(result) {
   }
   controller.sastAttackItems = attackItems;
 
+  const bucketMarkup = {
+    critical: [],
+    high: [],
+    medium: [],
+    low: [],
+    info: []
+  };
   attackItems.forEach((item, index) => {
     if (!item) return;
-    $("#attacks_info").append(rutils.bindSASTAttack(item, index));
+    const attackHtml = rutils.bindSASTAttack(item, index);
+    const bucket = getSastBucket(item);
+    bucketMarkup[bucket].push(attackHtml);
   });
+  $("#attacks_info").html([
+    `<div class="sast_bucket${bucketMarkup.critical.length ? " has-items" : ""}" data-bucket="critical">${bucketMarkup.critical.join("")}</div>`,
+    `<div class="sast_bucket${bucketMarkup.high.length ? " has-items" : ""}" data-bucket="high">${bucketMarkup.high.join("")}</div>`,
+    `<div class="sast_bucket${bucketMarkup.medium.length ? " has-items" : ""}" data-bucket="medium">${bucketMarkup.medium.join("")}</div>`,
+    `<div class="sast_bucket${bucketMarkup.low.length ? " has-items" : ""}" data-bucket="low">${bucketMarkup.low.join("")}</div>`,
+    `<div class="sast_bucket${bucketMarkup.info.length ? " has-items" : ""}" data-bucket="info">${bucketMarkup.info.join("")}</div>`
+  ].join(""));
 
-  rutils.sortAttacks();
-  if (findings.length) {
-    populateSastRuleFilterOptionsFromFindings(findings);
+  const deferWork = () => {
+    const scanning = typeof result.isScanRunning === "boolean"
+      ? result.isScanRunning
+      : !!controller._sastIsScanning;
+    controller._sastIsScanning = scanning;
+    // Keep bucket ordering; avoid DOM re-sorts.
+    if (findings.length) {
+      populateSastRuleFilterOptionsFromFindings(findings);
+    } else {
+      populateSastRuleFilterOptions(attackItems);
+    }
+    triggerSastStatsEvent(raw, vm);
+    refreshSastFiltersAfterRender();
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(deferWork);
   } else {
-    populateSastRuleFilterOptions(attackItems);
+    setTimeout(deferWork, 0);
   }
-  triggerSastStatsEvent(raw, vm);
-  refreshSastFiltersAfterRender();
 }
 
 function bindModules(result) {
@@ -1043,10 +1185,121 @@ function bindAttackProgress(message) {
   $("#progress_message").show()
 }
 
+function applySastFindingsDelta(message) {
+  const findings = Array.isArray(message?.findings) ? message.findings : [];
+  if (!findings.length) return;
+  if (!controller.scanViewModel) {
+    if (message?.scanResult) {
+      bindScanResult({ scanResult: message.scanResult });
+    }
+    return;
+  }
+  if (!Array.isArray(controller.scanViewModel.findings)) {
+    controller.scanViewModel.findings = [];
+  }
+  if (!Array.isArray(controller.sastAttackItems)) {
+    controller.sastAttackItems = [];
+  }
+  controller._sastIsScanning = typeof message?.isScanRunning === "boolean"
+    ? message.isScanRunning
+    : controller._sastIsScanning;
+  findings.forEach((finding) => {
+    if (!finding) return;
+    SAST_DELTA_QUEUE.push(finding);
+  });
+  if (!sastFlushTimer) {
+    sastFlushTimer = setTimeout(flushSastQueue, SAST_FLUSH_INTERVAL_MS);
+  }
+  if (message?.stats) {
+    rutils.bindStats(message.stats, "sast");
+  }
+}
+
+function incrementSastRuleOption(finding) {
+  if (!finding) return;
+  const rawId = finding.ruleId || finding.id || "";
+  if (!rawId) return;
+  const key = encodeURIComponent(rawId);
+  if (!controller._sastRuleCounts) controller._sastRuleCounts = new Map();
+  const existing = controller._sastRuleCounts.get(key);
+  const label = existing?.label || finding.ruleName || finding.moduleName || rawId;
+  const nextCount = (existing?.count || 0) + 1;
+  controller._sastRuleCounts.set(key, { label, count: nextCount });
+  if (!controller._sastKnownRuleIds) controller._sastKnownRuleIds = new Set();
+  controller._sastKnownRuleIds.add(key);
+
+  const $dropdown = getRuleFilterDropdown();
+  if (!$dropdown.length) return;
+  const $item = $dropdown.find(`.menu .item[data-value="${key}"]`);
+  if ($item.length) {
+    const $desc = $item.find(".description");
+    if ($desc.length) {
+      $desc.text(String(nextCount));
+    } else {
+      $item.prepend(`<span class="description">${ptk_utils.escapeHtml(String(nextCount))}</span>`);
+    }
+  } else {
+    $dropdown.find(".menu").append(
+      `<div class="item" data-value="${key}"><span class="description">${ptk_utils.escapeHtml(
+        String(nextCount)
+      )}</span>${ptk_utils.escapeHtml(label)}</div>`
+    );
+  }
+  $dropdown.dropdown("refresh");
+  $dropdown.toggleClass("disabled", false);
+}
+
+function flushSastQueue() {
+  sastFlushTimer = null;
+  if (!SAST_DELTA_QUEUE.length) return;
+  const batch = SAST_DELTA_QUEUE.splice(0, SAST_DELTA_QUEUE.length);
+  const attackMarkup = [];
+  const requestMarkup = [];
+  const knownFiles = controller._sastKnownFilesCanon || new Set();
+
+  batch.forEach((finding) => {
+    if (!finding) return;
+    controller.scanViewModel.findings.push(finding);
+    const file = finding?.location?.file || finding?.pageUrl || null;
+    if (file) {
+      const canon = typeof rutils?.canonicalizeSastFileId === "function"
+        ? rutils.canonicalizeSastFileId(file)
+        : file;
+      if (canon && !knownFiles.has(canon)) {
+        knownFiles.add(canon);
+        requestMarkup.push(bindRequest(file));
+      }
+    }
+    const index = controller.sastAttackItems.length;
+    const item = buildSastItemFromFinding(finding, index);
+    if (!item) return;
+    controller.sastAttackItems.push(item);
+    const attackHtml = rutils.bindSASTAttack(item, index);
+    const bucket = getSastBucket(item);
+    attackMarkup.push({ html: attackHtml, bucket });
+    incrementSastRuleOption(finding);
+  });
+
+  controller._sastKnownFilesCanon = knownFiles;
+  if (requestMarkup.length) {
+    $("#request_info").append(requestMarkup.join(""));
+  }
+  if (attackMarkup.length) {
+    ensureSastBuckets();
+    attackMarkup.forEach(({ html, bucket }) => {
+      appendSastToBucket(html, bucket);
+    });
+  }
+}
+
 function handleStructuredSastMessage(type, payload, scanResult) {
   const data = payload || {};
   if (type === "scan:start") {
     bindAttackProgress({ info: { message: "Scan started", file: data.totalFiles || "" } });
+    controller._sastIsScanning = true;
+    showRunningForm({ scanResult: controller.scanResult?.scanResult || { host: data.host || "" } });
+    hideScanForm();
+    hideWelcomeForm();
   }
   if (type === "file:start") {
     bindAttackProgress({ info: { message: "Scanning file", file: data.file || "" } });
@@ -1059,12 +1312,13 @@ function handleStructuredSastMessage(type, payload, scanResult) {
   }
   if (type === "scan:summary") {
     bindAttackProgress({ info: { message: "Scan summary", file: (data.totalFindings || 0) + " findings" } });
+    controller._sastIsScanning = false;
   }
   if (type === "scan:error") {
     bindAttackProgress({ info: { message: "Scan error", file: data.error || "" } });
   }
   if (scanResult) {
-    bindScanResult({ scanResult: scanResult });
+    bindScanResult({ scanResult: scanResult, isScanRunning: controller._sastIsScanning });
   }
 }
 
@@ -1121,8 +1375,8 @@ function populateSastRuleFilterOptions(items) {
   const collection = Array.isArray(items)
     ? items
     : (items && typeof items === "object"
-        ? Object.keys(items).map((key) => items[key])
-        : []);
+      ? Object.keys(items).map((key) => items[key])
+      : []);
   if (collection.length) {
     collection.forEach((item) => {
       if (!item) return;
@@ -1139,6 +1393,8 @@ function populateSastRuleFilterOptions(items) {
       map.set(key, entry);
     });
   }
+  controller._sastKnownRuleIds = new Set(map.keys());
+  controller._sastRuleCounts = map;
   renderSastRuleFilterMenu(map);
 }
 
@@ -1160,6 +1416,8 @@ function populateSastRuleFilterOptionsFromFindings(findings) {
       map.set(key, entry);
     });
   }
+  controller._sastKnownRuleIds = new Set(map.keys());
+  controller._sastRuleCounts = map;
   renderSastRuleFilterMenu(map);
 }
 
@@ -1372,8 +1630,17 @@ browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
       case "scan:error":
         handleStructuredSastMessage(type, payload || message, scanResult);
         break;
-      case "progress":
-        bindAttackProgress({ info: info || payload });
+    case "progress":
+      bindAttackProgress({ info: info || payload });
+      if (!controller._sastIsScanning) {
+        controller._sastIsScanning = true;
+        showRunningForm({ scanResult: controller.scanResult?.scanResult || { host: info?.host || "" } });
+        hideScanForm();
+        hideWelcomeForm();
+      }
+      break;
+      case "findings_delta":
+        applySastFindingsDelta(message);
         break;
       case "update findings":
         bindScanResult(message);

@@ -5,6 +5,14 @@ import {
 } from "./common/scanResults.js"
 import retire from '../packages/retire/retire.js';
 import CryptoES from '../packages/crypto-es/index.js';
+import {
+    normalizeComponentEntry,
+    buildFindingsFromComponents,
+    buildFindingsFromLegacyScan,
+    normalizeExistingScaFindings,
+    isFlatScaFindingList
+} from "./sca/findingBuilder.js"
+import buildExportScanResult from "./export/buildExportScanResult.js"
 
 const worker = self
 
@@ -67,111 +75,99 @@ export class ptk_sca {
     getScanResultSchema() {
         const envelope = createScanResultEnvelope({
             engine: "SCA",
-            scanId: null,
+            scanId: ptk_utils.UUID(),
             host: null,
             tabId: null,
             startedAt: new Date().toISOString(),
             settings: {}
         })
-        return {
-            version: envelope.version,
-            engine: "SCA",
-            scanId: envelope.scanId,
-            host: null,
-            startedAt: envelope.startedAt,
-            finishedAt: null,
-            stats: {
-                findingsCount: 0,
-                high: 0,
-                medium: 0,
-                low: 0,
-                info: 0
-            },
-            findings: []
-        }
+        envelope.packages = []
+        return envelope
     }
 
     _normalizeEnvelope(raw) {
         if (!raw || typeof raw !== 'object') {
             return this.getScanResultSchema()
         }
-        const findings = this._normalizeFindings(raw.findings || raw.items || raw.components || [])
-        const stats = this._recalculateStats(findings)
         const startedAt = raw.startedAt || raw.date || raw.started_at || raw.created_at || raw.timestamp || new Date().toISOString()
         const finishedAt = raw.finishedAt || raw.finished || raw.finished_at || raw.completed_at || null
-        return {
-            version: raw.version || '1.0',
-            engine: raw.engine || (raw.type && raw.type.toUpperCase()) || "SCA",
-            scanId: raw.scanId || raw.id || null,
+        const scanId = raw.scanId || raw.id || ptk_utils.UUID()
+        const envelope = createScanResultEnvelope({
+            engine: "SCA",
+            scanId,
             host: raw.host || raw.hostname || raw.domain || null,
+            tabId: null,
             startedAt,
-            finishedAt,
-            stats,
-            findings
-        }
-    }
-
-    _normalizeFindings(list) {
-        if (!list) return []
-        let entries = []
-        if (Array.isArray(list)) {
-            entries = list
-        } else if (typeof list === 'object') {
-            entries = Object.values(list)
+            settings: raw.settings || {}
+        })
+        envelope.finishedAt = finishedAt
+        const rawFindings = Array.isArray(raw.findings) ? raw.findings : []
+        let findings = []
+        if (isFlatScaFindingList(rawFindings)) {
+            findings = normalizeExistingScaFindings(rawFindings, { scanId })
         } else {
-            return []
+            findings = buildFindingsFromLegacyScan(raw, { scanId, createdAt: startedAt })
         }
-        return entries
-            .map(entry => this._normalizeComponentEntry(entry))
-            .filter(Boolean)
+        envelope.findings = findings
+        envelope.packages = this._buildPackagesFromFindings(findings)
+        envelope.stats = this._recalculateStats(findings, envelope.packages)
+        return envelope
     }
 
-    _normalizeComponentEntry(entry) {
-        if (!entry || typeof entry !== 'object') return null
-        const clone = Object.assign({}, entry)
-        clone.file = clone.file || clone.url || clone.path || null
-        clone.component = clone.component || clone.library || clone.name || null
-        clone.version = clone.version || clone.libraryVersion || clone.libVersion || null
-        clone.findings = this._normalizeVulnerabilities(clone.findings || clone.vulnerabilities || clone.vulns || [])
-        return clone
-    }
-
-    _normalizeVulnerabilities(list) {
-        if (!Array.isArray(list)) return []
-        return list
-            .map(vuln => {
-                if (!vuln || typeof vuln !== 'object') return null
-                const clone = Object.assign({}, vuln)
-                if (clone.severity) {
-                    clone.severity = String(clone.severity).toLowerCase()
-                } else {
-                    clone.severity = 'medium'
-                }
-                return clone
-            })
-            .filter(Boolean)
-    }
-
-    _recalculateStats(findings = []) {
+    _recalculateStats(findings = [], packages = []) {
         const stats = {
             findingsCount: 0,
+            packagesCount: 0,
+            critical: 0,
             high: 0,
             medium: 0,
             low: 0,
             info: 0
         }
-        findings.forEach(component => {
-            const vulns = Array.isArray(component?.findings) ? component.findings : []
-            vulns.forEach(vuln => {
-                stats.findingsCount += 1
-                const sev = String(vuln?.severity || '').toLowerCase()
-                if (sev === 'high' || sev === 'critical') stats.high += 1
-                else if (sev === 'medium') stats.medium += 1
-                else if (sev === 'low') stats.low += 1
-                else stats.info += 1
-            })
+        if (!Array.isArray(findings)) return stats
+        findings.forEach(finding => {
+            if (!finding) return
+            stats.findingsCount += 1
+            const sev = String(finding.severity || '').toLowerCase()
+            if (sev === 'critical') stats.critical += 1
+            else if (sev === 'high') stats.high += 1
+            else if (sev === 'medium') stats.medium += 1
+            else if (sev === 'low') stats.low += 1
+            else stats.info += 1
         })
+        if (Array.isArray(packages)) {
+            stats.packagesCount = packages.length
+        }
         return stats
+    }
+
+    _buildPackagesFromFindings(findings = []) {
+        if (!Array.isArray(findings)) return []
+        const map = new Map()
+        findings.forEach(finding => {
+            const evidence = finding?.evidence?.sca || {}
+            const component = evidence.component || {}
+            const name = component.name || component.component || finding?.ruleName || null
+            if (!name) return
+            const version = component.version || null
+            const file = evidence.sourceFile || finding?.location?.file || null
+            const key = `${String(name).toLowerCase()}::${String(version || '').toLowerCase()}::${String(file || '').toLowerCase()}`
+            if (!map.has(key)) {
+                map.set(key, {
+                    name,
+                    version,
+                    file,
+                    npmname: component.npmname || null,
+                    purl: component.purl || null,
+                    basePurl: component.basePurl || null,
+                    detection: component.detection || null,
+                    source: component.source || null,
+                    ecosystem: component.ecosystem || null,
+                    locations: Array.isArray(component.locations) ? component.locations : []
+                })
+            }
+        })
+        return Array.from(map.values())
     }
 
     async reset() {
@@ -222,14 +218,19 @@ export class ptk_sca {
             if (!this.urls.includes(response.url)) {
                 self.urls.push(response.url)
                 self.scan(response.url).then(result => {
-                    if (result.vulns.length > 0) {
-                        let finding = {
-                            file: result.vulns[0][0],
-                            component: result.vulns[0][1][0]['component'],
-                            version: result.vulns[0][1][0]['version'],
-                            findings: result.vulns[0][1][0].vulnerabilities
+                    const components = self._convertRuntimeResults(result?.vulns || [])
+                    if (!components.length) {
+                        return
+                    }
+                    const newFindings = buildFindingsFromComponents(components, {
+                        scanId: self.scanResult?.scanId || null,
+                        createdAt: new Date().toISOString()
+                    })
+                    if (newFindings.length) {
+                        if (!Array.isArray(self.scanResult.findings)) {
+                            self.scanResult.findings = []
                         }
-                        self.scanResult.findings.push(finding)
+                        self.scanResult.findings.push(...newFindings)
                         self.updateScanResult()
                     }
                 })
@@ -238,8 +239,11 @@ export class ptk_sca {
     }
 
     updateScanResult() {
-
-        this.scanResult.stats = this._recalculateStats(this.scanResult.findings)
+        this.scanResult.packages = this._buildPackagesFromFindings(this.scanResult.findings)
+        this.scanResult.stats = this._recalculateStats(this.scanResult.findings, this.scanResult.packages)
+        if (!Array.isArray(this.scanResult.groups)) {
+            this.scanResult.groups = []
+        }
         ptk_storage.setItem(this.storageKey, this.scanResult)
     }
 
@@ -291,6 +295,32 @@ export class ptk_sca {
             await Promise.all(fetches).then()
         }
         return Promise.resolve({ "vulns": dt })
+    }
+
+    _convertRuntimeResults(entries = []) {
+        const components = []
+        entries.forEach(tuple => {
+            if (!Array.isArray(tuple) || tuple.length < 2) return
+            const sourceFile = tuple[0] || null
+            const detections = tuple[1]
+            if (!Array.isArray(detections)) return
+            detections.forEach(item => {
+                if (!item || typeof item !== "object") return
+                const normalized = normalizeComponentEntry({
+                    file: sourceFile,
+                    component: item.component,
+                    version: item.version,
+                    detection: item.detection,
+                    npmname: item.npmname,
+                    basePurl: item.basePurl,
+                    findings: item.vulnerabilities || []
+                })
+                if (normalized && Array.isArray(normalized.findings) && normalized.findings.length) {
+                    components.push(normalized)
+                }
+            })
+        })
+        return components
     }
 
 
@@ -408,7 +438,13 @@ export class ptk_sca {
         if (!url) {
             return { success: false, json: { message: "Portal endpoint is not configured." } }
         }
-        const payload = JSON.parse(JSON.stringify(this.scanResult))
+        const payload = buildExportScanResult(this.scanResult?.scanId, {
+            target: "portal",
+            scanResult: this.scanResult
+        })
+        if (!payload) {
+            return { success: false, json: { message: "Scan result is empty" } }
+        }
         if (message?.projectId) {
             payload.projectId = message.projectId
         }
@@ -431,6 +467,19 @@ export class ptk_sca {
             })
             .catch(e => ({ success: false, json: { message: 'Error while saving report: ' + e.message } }))
         return response
+    }
+
+    async msg_export_scan_result(message) {
+        if (!this.scanResult) return null
+        try {
+            return buildExportScanResult(this.scanResult?.scanId, {
+                target: message?.target || "download",
+                scanResult: this.scanResult
+            })
+        } catch (err) {
+            console.error("[PTK SCA] Failed to export scan result", err)
+            throw err
+        }
     }
 
     async msg_download_scans(message) {
@@ -571,6 +620,9 @@ export class ptk_sca {
     }
 
     async runBackroungScan(tabId, host) {
+        if (this.isScanRunning) {
+            return false
+        }
         await this.reset()
         await this.ensureRepoReady()
         this.isScanRunning = true

@@ -138,8 +138,8 @@ export class ptk_session {
     }
 
     buildCookieUrl(cookie) {
-        if (!cookie.secure && worker.ptk_app.proxy?.activeTab)
-            cookie.secure = worker.ptk_app.proxy.activeTab.url.indexOf("https://") === 0
+        if (!cookie.secure && worker.ptk_app.proxy?.getDashboardTab())
+            cookie.secure = worker.ptk_app.proxy.getDashboardTab().url.indexOf("https://") === 0
         if (cookie.domain.substr(0, 1) === '.')
             cookie.domain = cookie.domain.substring(1)
         return "http" + ((cookie.secure) ? "s" : "") + "://" + cookie.domain + cookie.path
@@ -173,7 +173,7 @@ export class ptk_session {
 
 
     async msg_init(message) {
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         this.storage = await this.init()
         return Promise.resolve(Object.assign({}, activeTab, { cookies: cookies, storage: this.storage }))
@@ -181,7 +181,7 @@ export class ptk_session {
 
 
     async msg_remove_all(message) {
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         for (var i = 0; i < cookies.length; i++) {
             let cookie = cookies[i]
@@ -192,7 +192,7 @@ export class ptk_session {
     }
 
     async msg_remove_one(message) {
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         let cookie = cookies[message.index]
 
@@ -203,7 +203,7 @@ export class ptk_session {
 
     //Export Import
     async msg_export(message) {
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         return Promise.resolve(Object.assign({}, { cookie: cookies }))
     }
@@ -220,7 +220,7 @@ export class ptk_session {
     //Block 
     async msg_block_one(message) {
         this.storage = await ptk_storage.getItem(this.storageKey)
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         let cookie = cookies[message.index]
 
@@ -258,7 +258,7 @@ export class ptk_session {
 
     async msg_readonly_one(message) {
         this.storage = await ptk_storage.getItem(this.storageKey)
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         let cookie = cookies[message.index]
 
@@ -288,7 +288,7 @@ export class ptk_session {
     //Save/update
 
     async msg_save_one(message) {
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = await this.getAllCookiesByTab(activeTab.tabId)
         let cookie = this.buildCookie(message.values)
         await this.removeCookie(message.values)

@@ -1,6 +1,9 @@
 /**
  * Infer engine from legacy result.type.
  */
+import { normalizeCwe, normalizeOwasp, toLegacyOwaspString } from "../../../background/common/normalizeMappings.js"
+import { normalizeFinding as normalizeFindingShape } from "./findingNormalizer.js"
+
 function inferEngineFromType(type) {
     if (!type) return null
     const t = String(type).toLowerCase()
@@ -30,13 +33,47 @@ function normalizeStats(stats = {}) {
  */
 function normalizeFinding(f) {
     if (!f || typeof f !== "object") return f
-    const loc = f.location || {}
+    const base = normalizeFindingShape({ ...f }, { engine: f.engine })
+    const loc = base.location || {}
+    const engine = (base.engine || "").toUpperCase()
+    const iastEvidence = engine === "IAST" && base.evidence && typeof base.evidence === "object"
+        ? base.evidence.iast || null
+        : null
+    const normalizedOwasp = normalizeOwasp(base.owasp)
+    const normalizedCwe = normalizeCwe(base.cwe)
+    const owaspPrimary = normalizedOwasp.length ? normalizedOwasp[0] : null
+    const owaspLegacy = toLegacyOwaspString(normalizedOwasp)
+    const affectedUrls = engine === "IAST"
+        ? (Array.isArray(iastEvidence?.affectedUrls) ? iastEvidence.affectedUrls.slice() : [])
+        : (Array.isArray(base.affectedUrls) ? base.affectedUrls.slice() : [])
+    const sinkSummary = engine === "IAST"
+        ? (iastEvidence?.sinkSummary && typeof iastEvidence.sinkSummary === "object" ? iastEvidence.sinkSummary : null)
+        : (base.sinkSummary || null)
+    const taintSummary = engine === "IAST"
+        ? (iastEvidence?.taintSummary && typeof iastEvidence.taintSummary === "object" ? iastEvidence.taintSummary : null)
+        : (base.taintSummary || null)
+    const sinkId = engine === "IAST"
+        ? (iastEvidence?.sinkId || null)
+        : (base.sinkId || null)
+    const taintSource = engine === "IAST"
+        ? (iastEvidence?.taintSource || null)
+        : (base.taintSource || null)
+    const source = engine === "IAST"
+        ? (iastEvidence?.source || null)
+        : (base.source || null)
+    const runtimeUrl = engine === "IAST"
+        ? (iastEvidence?.routing?.runtimeUrl || iastEvidence?.routing?.url || null)
+        : null
     return {
-        ...f,
-        engine: f.engine || null,
-        severity: (f.severity || "").toLowerCase() || "medium",
+        ...base,
+        engine: engine || null,
+        severity: (base.severity || "").toLowerCase() || "medium",
+        owasp: normalizedOwasp,
+        owaspPrimary,
+        owaspLegacy,
+        cwe: normalizedCwe,
         location: {
-            url: loc.url || null,
+            url: runtimeUrl || loc.url || null,
             file: loc.file || null,
             line: loc.line || null,
             column: loc.column || null,
@@ -45,7 +82,13 @@ function normalizeFinding(f) {
             elementId: loc.elementId || null,
             method: loc.method || null,
             param: loc.param || null
-        }
+        },
+        affectedUrls,
+        sinkSummary,
+        taintSummary,
+        sinkId,
+        taintSource,
+        source
     }
 }
 

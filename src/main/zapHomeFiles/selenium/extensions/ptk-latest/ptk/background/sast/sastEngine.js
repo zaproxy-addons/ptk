@@ -148,13 +148,14 @@ function classifyFileLibrary(fileMeta, active) {
 /* ───────────────────────────────────────────────────────────────────────────── */
 
 export class sastEngine {
-  constructor(policy, opts) {
+  constructor(scanStrategy, opts) {
     // Old (sync) approach depended on immediate imports.
     // Now we load JSON packs asynchronously, so keep a promise.
     this.rules = [];
-    this._policy = policy;
+    this._scanStrategy = scanStrategy;
     this._scanId = opts?.scanId || null;
     this._FINDINGS_LIMIT = opts?.FINDINGS_LIMIT || 300
+    this._allowFetchExternalScripts = opts?.allowFetchExternalScripts !== false;
 
     // Catalog-driven libraries (optional; no policy needed)
     this._catalog = opts?.catalog || {};
@@ -340,7 +341,7 @@ export class sastEngine {
       const totalFiles = (Array.isArray(scripts) ? scripts.length : 0) + inlineSnippets.length;
       this.events.emit("scan:start", {
         scanId: this._scanId,
-        policy: this._policy,
+        scanStrategy: this._scanStrategy,
         totalFiles
       });
 
@@ -363,17 +364,26 @@ export class sastEngine {
         this.events.emit("file:start", { scanId: this._scanId, file: fileId, index: seenFiles.length, totalFiles });
         pushFile(fileId);
 
-        let code = script.code;
-        if (script.src) {
-          this.events.emit("progress", { message: "Parsing external scripts", file: script.src });
-          try {
-            const res = await fetch(script.src);
-            if (!res.ok) {
-              throw new Error(`HTTP ${res.status}`);
+        const captured = typeof script.code === "string" ? script.code : "";
+        const hasCaptured = Boolean(captured && captured.trim().length);
+        let code = hasCaptured ? captured : "";
+
+        if (script.src && hasCaptured) {
+        }
+
+        if (script.src && !hasCaptured) {
+          if (this._allowFetchExternalScripts) {
+            this.events.emit("progress", { message: "Parsing external scripts", file: script.src });
+            try {
+              const res = await fetch(script.src);
+              if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+              }
+              code = await res.text();
+            } catch (err) {
+              continue;
             }
-            code = await res.text();
-          } catch (err) {
-            console.warn("[SAST] fetch failed; skipping script:", script.src, err?.message);
+          } else if (!hasCaptured) {
             continue;
           }
         }
@@ -540,6 +550,28 @@ ${normalizedSnippet}
         }
       }
 
+      const filterFindingsByLibrary = (issues) => {
+        return issues.filter((issue) => {
+          const candidates = [
+            issue?.sinkFile,
+            issue?.sinkFileFull,
+            issue?.file,
+            issue?.sourceFile,
+            issue?.sourceFileFull
+          ].filter(Boolean).flatMap(normKeys);
+
+          if (!candidates.length) return true;
+
+          for (const k of candidates) {
+            const lib = this._libByFile.get(k);
+            if (lib && (lib.mode === "parse_no_report" || lib.mode === "summarize")) {
+              return false;
+            }
+          }
+          return true;
+        });
+      };
+
       for (const module of this.modules) {
         this.events.emit("module:start", {
           scanId: this._scanId,
@@ -553,7 +585,7 @@ ${normalizedSnippet}
           { file, comments: allComments, codeByFile },
           ancestor,
           {
-            policy: this._policy,
+            scanStrategy: this._scanStrategy,
             globalTaintCtx
           }
         );
@@ -566,31 +598,21 @@ ${normalizedSnippet}
           findingsCount: Array.isArray(moduleFindings) ? moduleFindings.length : 0
         });
 
+        const partialFindings = Array.isArray(moduleFindings) ? filterFindingsByLibrary(moduleFindings) : [];
+        if (partialFindings.length) {
+          this.events.emit("findings:partial", {
+            scanId: this._scanId,
+            file,
+            moduleId: module.id,
+            findings: partialFindings
+          });
+        }
+
         rawFindings.push(...moduleFindings);
         if (rawFindings.length >= this._FINDINGS_LIMIT) break;
       }
 
-      const filteredFindings = rawFindings.filter((issue) => {
-        const candidates = [
-          issue?.sinkFile,
-          issue?.sinkFileFull,
-          issue?.file,
-          issue?.sourceFile,
-          issue?.sourceFileFull
-        ].filter(Boolean).flatMap(normKeys);
-
-        if (!candidates.length) return true;
-
-        for (const k of candidates) {
-          const lib = this._libByFile.get(k);
-          if (lib && (lib.mode === "parse_no_report" || lib.mode === "summarize")) {
-            //console.info('[LIB:suppress]', lib.libId, lib.mode, 'for', k, '—', issue?.rule_id || issue?.message || '');
-            return false;
-          }
-        }
-        //console.info('[LIB:allow]', candidates[0], '— no library match');
-        return true;
-      });
+      const filteredFindings = filterFindingsByLibrary(rawFindings);
 
       const perFileCounts = new Map();
       const bumpCount = (key) => {

@@ -1,5 +1,6 @@
 /* Author: Denis Podgurskii */
 import { ptk_controller_session } from "../../../controller/session.js"
+import { registerDashboardTabListener, updateDashboardTab } from "../js/rutils.js"
 const controller = new ptk_controller_session()
 
 jQuery(function () {
@@ -195,8 +196,27 @@ jQuery(function () {
         event.stopPropagation()
     })
 
+    async function initWithActiveTab() {
+        try {
+            const tabs = await browser.tabs.query({ currentWindow: true })
+            const active = tabs && tabs.length ? tabs.find((t) => t.active) : null
+            const base = browser.runtime.getURL('')
+            const isExtensionUrl = (url) => !!url && url.startsWith(base)
+            if (active?.id && active?.url && !isExtensionUrl(active.url)) {
+                await updateDashboardTab(active.id, active.url)
+            }
+        } catch (_) { }
+        bindAll()
+    }
 
-    bindAll()
+    initWithActiveTab()
+
+    registerDashboardTabListener({
+        onTabChange: async ({ tabId, url }) => {
+            await updateDashboardTab(tabId, url)
+            bindAll(0)
+        }
+    })
 })
 
 /* Helpers */
@@ -233,9 +253,14 @@ function bindInfo() {
 function bindAll(index) {
     controller.init().then(function (result) {
         bindInfo()
-        if (controller.cookies) {
+        if (controller.cookies && Object.keys(controller.cookies).length) {
             controller.dt = controller.cookies.map((x, index) => ([index, x.domain, x.name]))
             bindAllCookies(index)
+            return
+        }
+        controller.dt = []
+        if ($.fn.dataTable.isDataTable('#tbl_cookies')) {
+            $('#tbl_cookies').DataTable().clear().draw(false)
         }
     }).catch(e => console.log(e))
 }
@@ -465,6 +490,3 @@ function getCookieForm(index) {
 
             </form>`
 }
-
-
-

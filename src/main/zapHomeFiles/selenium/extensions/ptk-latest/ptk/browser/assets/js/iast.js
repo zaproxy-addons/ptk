@@ -5,6 +5,7 @@ import { ptk_utils } from "../../../background/utils.js"
 import { ptk_decoder } from "../../../background/decoder.js"
 import * as rutils from "../js/rutils.js"
 import { normalizeScanResult } from "../js/scanResultViewModel.js"
+import { normalizeCwe, normalizeOwasp, toLegacyOwaspString } from "../../../background/common/normalizeMappings.js"
 
 const controller = new ptk_controller_iast()
 const request_controller = new ptk_controller_rbuilder()
@@ -20,13 +21,93 @@ const IAST_SEVERITY_ORDER = {
     low: 3,
     info: 4
 }
+const IAST_UNKNOWN_REQ = "__ptk_unknown__"
+const IAST_COUNTERS = buildIastCounters()
+const IAST_REQUEST_COUNTERS = new Map()
+const IAST_DELTA_QUEUE = []
+const IAST_FLUSH_INTERVAL_MS = 300
+let iastFlushTimer = null
+let iastRequestFilterDirty = false
+
+function buildIastCounters() {
+    return {
+        total: 0,
+        info: 0,
+        vuln: 0,
+        bySeverity: { critical: 0, high: 0, medium: 0, low: 0, info: 0 }
+    }
+}
+
+function resetIastCounters() {
+    const fresh = buildIastCounters()
+    IAST_COUNTERS.total = fresh.total
+    IAST_COUNTERS.info = fresh.info
+    IAST_COUNTERS.vuln = fresh.vuln
+    IAST_COUNTERS.bySeverity = fresh.bySeverity
+    IAST_REQUEST_COUNTERS.clear()
+}
+
+function normalizeIastSeverityValue(finding) {
+    const raw = finding?.effectiveSeverity || finding?.severity || "info"
+    const normalized = String(raw).toLowerCase()
+    if (normalized === "critical" || normalized === "high" || normalized === "medium" || normalized === "low" || normalized === "info") {
+        return normalized
+    }
+    return "info"
+}
+
+function ensureIastRequestCounters(requestKey) {
+    const key = requestKey || IAST_UNKNOWN_REQ
+    if (!IAST_REQUEST_COUNTERS.has(key)) {
+        IAST_REQUEST_COUNTERS.set(key, buildIastCounters())
+    }
+    return IAST_REQUEST_COUNTERS.get(key)
+}
+
+function updateIastCountersForFinding(finding, requestKey) {
+    const severity = normalizeIastSeverityValue(finding)
+    const isInfo = severity === "info"
+    const targets = [IAST_COUNTERS, ensureIastRequestCounters(requestKey)]
+    targets.forEach((counter) => {
+        counter.total += 1
+        counter.bySeverity[severity] = (counter.bySeverity[severity] || 0) + 1
+        if (isInfo) {
+            counter.info += 1
+        } else {
+            counter.vuln += 1
+        }
+    })
+}
+
+function getIastBaseCounters() {
+    const key = iastFilterState.requestKey || null
+    if (!key) return IAST_COUNTERS
+    return IAST_REQUEST_COUNTERS.get(key) || buildIastCounters()
+}
+
+function renderIastStatsFromCounters() {
+    const scope = iastFilterState.scope
+    const base = getIastBaseCounters()
+    const stats = {
+        findingsCount: base.total,
+        critical: base.bySeverity.critical || 0,
+        high: base.bySeverity.high || 0,
+        medium: base.bySeverity.medium || 0,
+        low: base.bySeverity.low || 0,
+        info: base.bySeverity.info || 0
+    }
+    if (scope === "vuln") {
+        stats.findingsCount = base.vuln
+        stats.info = 0
+    }
+    rutils.bindStats(stats, "iast")
+}
 
 function collectIastStatsFromElements($collection) {
-    const counts = { findingsCount: 0, vulnsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 }
+    const counts = { findingsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 }
     if (!$collection || typeof $collection.length === 'undefined') return counts
     $collection.each(function () {
         counts.findingsCount += 1
-        counts.vulnsCount += 1
         const severity = ($(this).attr('data-severity') || '').toLowerCase()
         if (severity === 'critical') counts.critical += 1
         else if (severity === 'high') counts.high += 1
@@ -58,8 +139,18 @@ function formatIastSeverityDisplay(value) {
     return normalized.charAt(0).toUpperCase() + normalized.slice(1)
 }
 
+function showResultModal(header, message) {
+    $('#result_header').text(header)
+    $('#result_message').text(message || '')
+    $('#result_dialog').modal('show')
+}
+
 function convertLegacyVulnToFinding(vuln, index) {
     if (!vuln) return null
+    const owasp = normalizeOwasp(vuln.owasp)
+    const cwe = normalizeCwe(vuln.cwe)
+    const owaspPrimary = owasp.length ? owasp[0] : null
+    const owaspLegacy = toLegacyOwaspString(owasp)
     return {
         id: vuln.id || `vuln-${index}`,
         ruleId: vuln.ruleId || vuln.id || vuln.category || `vuln-${index}`,
@@ -68,8 +159,10 @@ function convertLegacyVulnToFinding(vuln, index) {
         moduleName: vuln.moduleName || null,
         category: vuln.category || null,
         severity: vuln.severity || 'medium',
-        owasp: vuln.owasp || null,
-        cwe: vuln.cwe || null,
+        owasp,
+        owaspPrimary,
+        owaspLegacy,
+        cwe,
         tags: vuln.tags || [],
         location: { url: vuln.url || null, method: vuln.method || null },
         affectedUrls: vuln.url ? [vuln.url] : [],
@@ -100,16 +193,18 @@ function mergeLinkMaps(...sources) {
 function extractPrimaryIastEvidence(finding) {
     if (!finding) return null
     const evidence = finding.evidence
+    if (!evidence) return null
+    if (typeof evidence === 'object' && !Array.isArray(evidence)) {
+        if (evidence.iast && typeof evidence.iast === 'object') return evidence.iast
+        if (evidence.IAST && typeof evidence.IAST === 'object') return evidence.IAST
+        return evidence
+    }
     if (Array.isArray(evidence) && evidence.length) {
         const entry = evidence.find(ev => {
             const src = String(ev?.source || ev?.type || '').toLowerCase()
             return src === 'iast'
         })
         return entry || evidence[0] || null
-    }
-    if (evidence && typeof evidence === 'object') {
-        if (evidence.IAST) return evidence.IAST
-        if (evidence.iast) return evidence.iast
     }
     return null
 }
@@ -119,12 +214,10 @@ function buildIastItemFromFinding(finding, index) {
     const loc = finding.location || {}
     const evidenceEntry = extractPrimaryIastEvidence(finding)
     const ev = evidenceEntry || {}
-    const evRaw = ev.raw || {}
-    const severity = formatIastSeverityLabel(finding.severity || ev.severity || evRaw.severity)
+    const severity = formatIastSeverityLabel(finding.severity || 'info')
     const metaRule =
         finding.ruleName
         || finding.metadata?.name
-        || evRaw?.meta?.ruleName
         || finding.module_metadata?.name
         || finding.moduleName
         || ev.message
@@ -132,19 +225,17 @@ function buildIastItemFromFinding(finding, index) {
         || finding.ruleId
         || finding.id
         || `Finding ${index + 1}`
-    const taintSource = ev.taintSource || evRaw?.taintSource || finding.taintSource || finding.source || null
-    const sinkId = ev.sinkId || evRaw?.sinkId || finding.sinkId || finding.sink || null
-    const baseContext = Object.assign({}, evRaw?.context || {}, ev.context || {}, finding.context || {})
+    const taintSource = ev.taintSource || finding.taintSource || finding.source || null
+    const sinkId = ev.sinkId || finding.sinkId || finding.sink || null
+    const baseContext = Object.assign({}, ev.context || {}, finding.context || {})
     const flow = Array.isArray(baseContext.flow) ? baseContext.flow : []
     const tracePayload = ev.trace || baseContext.trace || finding.trace || null
-    const description = finding.description || finding.metadata?.description || ev.description || evRaw?.meta?.description || ''
-    const recommendation = finding.recommendation || finding.metadata?.recommendation || ev.recommendation || evRaw?.meta?.recommendation || ''
+    const description = finding.description || finding.metadata?.description || ev.message || ''
+    const recommendation = finding.recommendation || finding.metadata?.recommendation || ''
     const links = mergeLinkMaps(
         finding.links,
         finding.metadata?.links,
-        finding.module_metadata?.links,
-        ev.links,
-        evRaw?.meta?.links
+        finding.module_metadata?.links
     )
     const contextPayload = Object.assign(
         {
@@ -153,40 +244,87 @@ function buildIastItemFromFinding(finding, index) {
             elementOuterHTML: baseContext.elementOuterHTML || ev.elementOuterHTML || null,
             value: baseContext.value || ev.value || null,
             url: baseContext.url || loc.url || null,
-            elementId: baseContext.elementId || loc.elementId || null
+            elementId: baseContext.elementId || loc.elementId || null,
+            tagName: baseContext.tagName || ev.tagName || null
         },
         baseContext
     )
+    const owaspArray = Array.isArray(finding.owasp) ? finding.owasp : []
+    const owaspPrimary = finding.owaspPrimary || (owaspArray.length ? owaspArray[0] : null)
+    const owaspLegacy = finding.owaspLegacy || toLegacyOwaspString(owaspArray)
     const normalizedEvidenceEntry = {
         source: 'IAST',
         taintSource,
         sinkId,
+        schemaVersion: ev.schemaVersion || null,
+        primaryClass: ev.primaryClass || null,
+        sourceRole: ev.sourceRole || null,
+        origin: ev.origin || null,
+        observedAt: ev.observedAt || null,
+        operation: ev.operation || null,
+        detection: ev.detection || null,
+        routing: ev.routing || null,
         context: contextPayload,
         matched: ev.matched || finding.matched || null,
         trace: tracePayload,
+        traceSummary: ev.traceSummary || null,
+        flowSummary: ev.flowSummary || null,
+        sourceKind: ev.sourceKind || null,
+        sourceKey: ev.sourceKey || null,
+        sourceValuePreview: ev.sourceValuePreview || null,
+        sources: ev.sources || null,
+        primarySource: ev.primarySource || null,
+        secondarySources: ev.secondarySources || null,
+        sinkContext: ev.sinkContext || null,
+        sinkSummary: ev.sinkSummary || finding.sinkSummary || null,
+        taintSummary: ev.taintSummary || finding.taintSummary || null,
+        allowedSources: ev.allowedSources || finding.allowedSources || null,
         raw: {
             severity,
             meta: { ruleName: metaRule },
             sinkId,
             source: taintSource,
             type: finding.category || null,
-            owasp: finding.owasp || null,
-            cwe: finding.cwe || null,
+            owasp: owaspArray,
+            cwe: Array.isArray(finding.cwe) ? finding.cwe : [],
             tags: finding.tags || [],
             location: loc,
             context: contextPayload
         }
     }
-    const affectedUrls = Array.isArray(finding.affectedUrls) ? finding.affectedUrls.slice() : []
-    if (loc.url) affectedUrls.unshift(loc.url)
+    const affectedUrls = []
+    const seenUrls = new Set()
+    const addUrl = (value, { prepend = false } = {}) => {
+        if (!value) return
+        const str = String(value).trim()
+        if (!str || seenUrls.has(str)) return
+        seenUrls.add(str)
+        if (prepend) {
+            affectedUrls.unshift(str)
+        } else {
+            affectedUrls.push(str)
+        }
+    }
+    addUrl(loc.url, { prepend: true })
+    if (Array.isArray(ev.affectedUrls)) {
+        ev.affectedUrls.forEach(url => addUrl(url))
+    }
+    if (Array.isArray(finding.affectedUrls)) {
+        finding.affectedUrls.forEach(url => addUrl(url))
+    }
+    addUrl(ev?.context?.url)
+    addUrl(ev?.context?.location)
     return {
         id: finding.id || `iast-${index}`,
         ruleId: finding.ruleId || finding.id || `rule-${index}`,
         ruleName: metaRule,
         severity,
         category: finding.category || null,
-        owasp: finding.owasp || null,
-        cwe: finding.cwe || null,
+        confidence: Number.isFinite(finding.confidence) ? finding.confidence : null,
+        owasp: owaspArray,
+        owaspPrimary,
+        owaspLegacy,
+        cwe: Array.isArray(finding.cwe) ? finding.cwe : [],
         tags: finding.tags || [],
         location: loc,
         affectedUrls: affectedUrls.filter(Boolean),
@@ -206,7 +344,7 @@ function buildIastItemFromFinding(finding, index) {
         },
         module_metadata: {
             id: finding.module_metadata?.id || finding.moduleId || null,
-            name: finding.module_metadata?.name || evRaw?.meta?.moduleName || finding.moduleName || null,
+            name: finding.module_metadata?.name || finding.moduleName || null,
             links: finding.module_metadata?.links || links
         },
         requestId: index,
@@ -230,7 +368,6 @@ function triggerIastStatsEvent(rawScanResult, viewModel) {
     const raw = rawScanResult || {}
     const vm = viewModel || normalizeScanResult(raw)
     const stats = vm.stats || raw.stats || {}
-    controller._iastBaseStats = stats
     $(document).trigger("bind_stats", Object.assign({}, raw, { stats }))
 }
 
@@ -277,7 +414,7 @@ jQuery(function () {
     })
 
     $(document).on("click", ".run_scan_runtime", function () {
-        controller.init().then(function (result) {
+        controller.init().then(async function (result) {
             if (!result?.activeTab?.url) {
                 $('#result_header').text("Error")
                 $('#result_message').text("Active tab not set. Reload required tab to activate tracking.")
@@ -289,11 +426,24 @@ jQuery(function () {
             $('#scan_host').text(h)
             // $('#scan_domains').text(h)
 
+            $('#iast-scan-strategy').val('SMART')
+            window._ptkIastReloadWarningClosed = false
+            let contentReady = true
+            contentReady = await rutils.pingContentScript(result.activeTab.tabId, { timeoutMs: 700 })
+            if (!window._ptkIastReloadWarningClosed) {
+                $('#ptk_scan_reload_warning').toggle(!contentReady)
+            }
+
             $('#run_scan_dlg')
                 .modal({
                     allowMultiple: true,
                     onApprove: function () {
-                        controller.runBackroungScan(result.activeTab.tabId, h).then(function (result) {
+                        const scanStrategy = $('#iast-scan-strategy').val() || 'SMART'
+                        if (!contentReady) {
+                            $('#ptk_scan_reload_warning').show()
+                            return false
+                        }
+                        controller.runBackroungScan(result.activeTab.tabId, h, scanStrategy).then(function (result) {
                             $("#request_info").html("")
                             $("#attacks_info").html("")
                             triggerIastStatsEvent(result.scanResult)
@@ -302,9 +452,23 @@ jQuery(function () {
                     }
                 })
                 .modal('show')
+            $('#iast_scans_form .question')
+                .popup({
+                    inline: true,
+                    hoverable: true,
+                    delay: {
+                        show: 300,
+                        hide: 800
+                    }
+                })
         })
 
         return false
+    })
+
+    $(document).on("click", "#ptk_scan_reload_warning_close_iast", function () {
+        window._ptkIastReloadWarningClosed = true
+        $('#ptk_scan_reload_warning').hide()
     })
 
     $(document).on("click", ".stop_scan_runtime", function () {
@@ -407,9 +571,9 @@ jQuery(function () {
     })
 
     $('.export_scan_btn').on('click', function () {
-        controller.init().then(function (result) {
-            if (hasRenderableIastData(result.scanResult)) {
-                let blob = new Blob([JSON.stringify(result.scanResult)], { type: 'text/plain' })
+        controller.exportScanResult().then(function (scanResult) {
+            if (scanResult && hasRenderableIastData(scanResult)) {
+                let blob = new Blob([JSON.stringify(scanResult)], { type: 'text/plain' })
                 let fName = "PTK_IAST_scan.json"
 
                 let downloadLink = document.createElement("a")
@@ -417,7 +581,11 @@ jQuery(function () {
                 downloadLink.innerHTML = "Download File"
                 downloadLink.href = window.URL.createObjectURL(blob)
                 downloadLink.click()
+            } else {
+                showResultModal("Error", "Nothing to export yet.")
             }
+        }).catch(err => {
+            showResultModal("Error", err?.message || "Unable to export scan")
         })
     })
 
@@ -579,7 +747,7 @@ jQuery(function () {
     $(document).on("bind_stats", function (e, scanResult) {
         if (scanResult?.stats) {
             rutils.bindStats(scanResult.stats, 'iast')
-            if (scanResult.stats.vulnsCount > 0) {
+            if ((scanResult.stats.findingsCount || 0) > 0) {
                 $('#filter_vuln').trigger("click")
             }
         }
@@ -598,10 +766,10 @@ jQuery(function () {
         changeView(result)
         if (hasRenderableIastData(result.scanResult)) {
             bindScanResult(result)
-        } else if (Array.isArray(result?.default_modules) && result.default_modules.length) {
+        } else if (!result.isScanRunning && Array.isArray(result?.default_modules) && result.default_modules.length) {
             bindModules(result)
             showWelcomeForm()
-        } else {
+        } else if (!result.isScanRunning) {
             showWelcomeForm()
         }
     }).catch(e => { console.log(e) })
@@ -612,16 +780,27 @@ function filterByRequestId(requestId) {
     toggleRequestFilter(requestId)
 }
 
+function setIastPageLoader(show) {
+    const $loader = $('#iast_page_loader')
+    if (!$loader.length) return
+    $loader.toggle(!!show)
+}
+
 function showWelcomeForm() {
+    setIastPageLoader(false)
+    $('#main').hide()
     $('#welcome_message').show()
     $('#run_scan_bg_control').show()
 }
 
 function hideWelcomeForm() {
     $('#welcome_message').hide()
+    $('#main').show()
 }
 
 function showRunningForm(result) {
+    setIastPageLoader(false)
+    $('#main').show()
     $('#scanning_url').text(result.scanResult.host)
     $('.scan_info').show()
     $('#stop_scan_bg_control').show()
@@ -634,6 +813,8 @@ function hideRunningForm() {
 }
 
 function showScanForm(result) {
+    setIastPageLoader(false)
+    $('#main').show()
     $('#run_scan_bg_control').show()
 }
 
@@ -663,9 +844,10 @@ function changeView(result) {
 
 function cleanScanResult() {
     $("#attacks_info").html("")
+    resetIastCounters()
     rutils.bindStats({
         attacksCount: 0,
-        vulnsCount: 0,
+        findingsCount: 0,
         critical: 0,
         high: 0,
         medium: 0,
@@ -677,7 +859,7 @@ function cleanScanResult() {
 function bindScanResult(result) {
     if (!result.scanResult) return
     const raw = result.scanResult || {}
-    const vm = normalizeScanResult(raw)
+    const vm = raw.__normalized ? raw : normalizeScanResult(raw)
     controller.scanResult = result
     controller.scanViewModel = vm
     $("#progress_message").hide()
@@ -686,9 +868,20 @@ function bindScanResult(result) {
     $('#request_info').html("")
     $('#attacks_info').html("")
     hideWelcomeForm()
+    IAST_DELTA_QUEUE.length = 0
+    if (iastFlushTimer) {
+        clearTimeout(iastFlushTimer)
+        iastFlushTimer = null
+    }
 
     const requests = prepareIastRequests(vm)
+    controller._iastRequests = requests
+    controller._iastRequestIndex = new Map()
+    requests.forEach((req) => {
+        if (req?._uiKey) controller._iastRequestIndex.set(req._uiKey, req)
+    })
     bindRequestList(requests)
+    iastRequestFilterDirty = true
     const requestIndex = buildIastRequestIndex(requests)
 
     const findings = Array.isArray(vm.findings) ? vm.findings : []
@@ -701,7 +894,21 @@ function bindScanResult(result) {
 
     let attackItems = []
     if (findings.length) {
-        attackItems = findings.map((finding, index) => buildIastItemFromFinding(finding, index)).filter(Boolean)
+        const showSuppressed = localStorage.getItem('ptk_iast_show_suppressed') === '1'
+        attackItems = findings.map((finding, index) => {
+            const item = buildIastItemFromFinding(finding, index)
+            if (item) {
+                item.__sourceFinding = finding
+                item.requestKey = finding?.requestKey || null
+            }
+            return item
+        })
+            .filter(Boolean)
+            .filter(item => {
+                if (showSuppressed) return true
+                const suppression = item?.evidence?.iast?.suppression
+                return !(suppression && suppression.suppressed)
+            })
     } else if (legacyItems.length) {
         attackItems = legacyItems.map((item, index) => {
             if (!item) return null
@@ -716,20 +923,187 @@ function bindScanResult(result) {
         }).filter(Boolean)
     }
     controller.iastAttackItems = attackItems
+    resetIastCounters()
+    const $attacksInfo = $("#attacks_info")
+    if (iastFilterState.requestKey) {
+        $attacksInfo.attr("data-request-key", iastFilterState.requestKey)
+    } else {
+        $attacksInfo.removeAttr("data-request-key")
+    }
+    updateIastRequestFilterStyle(iastFilterState.requestKey)
+    $attacksInfo.attr("data-scope", iastFilterState.scope)
 
+    const bucketMarkup = {
+        critical: [],
+        high: [],
+        medium: [],
+        low: [],
+        info: []
+    }
+    const bucketOrder = ['critical', 'high', 'medium', 'low', 'info']
     attackItems.forEach((item, index) => {
         if (!item) return
         item.__index = Number(index)
         item.requestId = index
-        item.requestKey = mapFindingToRequestKey(item, requestIndex)
-        $("#attacks_info").append(rutils.bindIASTAttack(item, index))
+        if (!item.requestKey) {
+            item.requestKey = mapFindingToRequestKey(item, requestIndex)
+        }
+        const bucket = getIastBucket(item)
+        bucketMarkup[bucket].push(rutils.bindIASTAttack(item, index))
+        updateIastCountersForFinding(item, item.requestKey)
+    })
+    const bucketHtml = bucketOrder
+        .map((bucket) => `<div class="iast_bucket${bucketMarkup[bucket].length ? ' has-items' : ''}" data-bucket="${bucket}">${bucketMarkup[bucket].join('')}</div>`)
+        .join('')
+    $("#attacks_info").html(bucketHtml)
+
+    const deferWork = () => {
+        const scanning = !!result.isScanRunning
+        controller._iastIsScanning = scanning
+        // Keep bucket ordering; avoid DOM re-sorts.
+        triggerIastStatsEvent(raw, vm)
+        if (iastRequestFilterDirty) {
+            updateRequestFilterActiveState()
+            iastRequestFilterDirty = false
+        }
+        applyIastFilters()
+    }
+    if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(deferWork)
+    } else {
+        setTimeout(deferWork, 0)
+    }
+}
+
+function applyIastScanDelta(message) {
+    const finding = message?.finding || null
+    if (!finding) return
+    if (!controller.scanViewModel) {
+        if (message?.scanResult) {
+            bindScanResult({ scanResult: message.scanResult, isScanRunning: message.isScanRunning })
+        }
+        return
+    }
+    if (!Array.isArray(controller.scanViewModel.findings)) {
+        controller.scanViewModel.findings = []
+    }
+    if (!Array.isArray(controller.iastAttackItems)) {
+        controller.iastAttackItems = []
+    }
+    IAST_DELTA_QUEUE.push(finding)
+    if (!iastFlushTimer) {
+        iastFlushTimer = setTimeout(flushIastQueue, IAST_FLUSH_INTERVAL_MS)
+    }
+}
+
+function upsertIastRequestFromFinding(finding) {
+    const requestKey = finding?.requestKey || null
+    if (!requestKey) return null
+    if (!controller._iastRequestIndex) {
+        controller._iastRequestIndex = new Map()
+    }
+    if (controller._iastRequestIndex.has(requestKey)) {
+        return null
+    }
+    const displayUrl = extractIastPrimaryUrl(finding) || finding?.location?.url || ""
+    const normalizedUrl = canonicalizeIastUrl(displayUrl)
+    const method = extractIastMethod(finding)
+    const entry = {
+        key: requestKey,
+        _uiKey: requestKey,
+        method,
+        displayUrl: displayUrl || normalizedUrl || requestKey,
+        url: normalizedUrl || displayUrl || "",
+        _normalizedUrl: normalizedUrl || "",
+        host: "",
+        status: null,
+        type: "finding",
+        lastSeen: Date.now()
+    }
+    controller._iastRequestIndex.set(requestKey, entry)
+    return entry
+}
+
+function flushIastQueue() {
+    iastFlushTimer = null
+    if (!IAST_DELTA_QUEUE.length) return
+    const $attacksInfo = $("#attacks_info")
+    if (iastFilterState.requestKey) {
+        $attacksInfo.attr("data-request-key", iastFilterState.requestKey)
+    } else {
+        $attacksInfo.removeAttr("data-request-key")
+    }
+    updateIastRequestFilterStyle(iastFilterState.requestKey)
+    $attacksInfo.attr("data-scope", iastFilterState.scope)
+    const batch = IAST_DELTA_QUEUE.splice(0, IAST_DELTA_QUEUE.length)
+    ensureIastBuckets($attacksInfo)
+    const attackMarkup = []
+    const requestMarkup = []
+    let requestAdded = false
+
+    batch.forEach((finding) => {
+        if (!finding) return
+        const index = controller.scanViewModel.findings.length
+        controller.scanViewModel.findings.push(finding)
+        const item = buildIastItemFromFinding(finding, index)
+        if (!item) return
+        item.__index = index
+        item.requestId = index
+        item.requestKey = finding?.requestKey || null
+        controller.iastAttackItems.push(item)
+        const bucket = getIastBucket(item)
+        attackMarkup.push({ html: rutils.bindIASTAttack(item, index), bucket })
+        updateIastCountersForFinding(item, item.requestKey)
+
+        const reqEntry = upsertIastRequestFromFinding(finding)
+        if (reqEntry) {
+            requestMarkup.push(bindRequest(reqEntry))
+            requestAdded = true
+        }
     })
 
-    rutils.sortAttacks()
-    controller._iastBaseStats = collectIastStatsFromElements($('.iast_attack_card'))
-    triggerIastStatsEvent(raw, vm)
-    updateRequestFilterActiveState()
-    applyIastFilters()
+    if (requestMarkup.length) {
+        $("#request_info").append(requestMarkup.join(""))
+    }
+    if (attackMarkup.length) {
+        attackMarkup.forEach(({ html, bucket }) => {
+            appendIastToBucket(html, bucket)
+        })
+    }
+
+    if (requestAdded || iastRequestFilterDirty) {
+        updateRequestFilterActiveState()
+        iastRequestFilterDirty = false
+    }
+    renderIastStatsFromCounters()
+}
+
+function ensureIastBuckets($container) {
+    if ($container.find('.iast_bucket').length) return
+    const buckets = ['critical', 'high', 'medium', 'low', 'info']
+    const markup = buckets.map((bucket) => `<div class="iast_bucket" data-bucket="${bucket}"></div>`)
+    $container.html(markup.join(''))
+}
+
+function appendIastToBucket(attackHtml, bucketKey) {
+    const selector = `.iast_bucket[data-bucket="${bucketKey}"]`
+    const $bucket = $("#attacks_info").find(selector)
+    if ($bucket.length) {
+        $bucket.addClass('has-items')
+        $bucket.append(attackHtml)
+    } else {
+        $("#attacks_info").append(attackHtml)
+    }
+}
+
+function getIastBucket(item) {
+    const severityRaw = item?.severity || item?.evidence?.raw?.severity || 'info'
+    const severity = String(severityRaw || 'info').toLowerCase()
+    if (severity === 'critical') return 'critical'
+    if (severity === 'high') return 'high'
+    if (severity === 'medium') return 'medium'
+    if (severity === 'low') return 'low'
+    return 'info'
 }
 
 function bindModules(result) {
@@ -806,14 +1180,11 @@ function extractIastDataset(source) {
 
 function extractIastPrimaryUrl(item) {
     if (item?.location?.url) return item.location.url
+    const ev = extractPrimaryIastEvidence(item) || {}
+    if (Array.isArray(ev?.affectedUrls) && ev.affectedUrls.length) return ev.affectedUrls[0]
     if (Array.isArray(item?.affectedUrls) && item.affectedUrls.length) return item.affectedUrls[0]
-    if (Array.isArray(item?.evidence)) {
-        const ev = item.evidence.find(e => e?.source === 'IAST') || item.evidence[0]
-        if (ev) {
-            const resolved = rutils.resolveIASTLocation(item, ev)
-            if (resolved) return resolved
-        }
-    }
+    if (ev?.context?.url) return ev.context.url
+    if (ev?.context?.location) return ev.context.location
     return ''
 }
 
@@ -829,9 +1200,23 @@ function prepareIastRequests(source) {
     dataset.forEach(item => {
         if (!item) return
         const primaryUrl = extractIastPrimaryUrl(item)
-        const candidateUrls = Array.isArray(item?.affectedUrls) && item.affectedUrls.length
-            ? item.affectedUrls.filter(Boolean)
-            : (primaryUrl ? [primaryUrl] : [])
+        const evidenceEntry = extractPrimaryIastEvidence(item) || {}
+        const candidateUrls = []
+        const addCandidate = (value) => {
+            if (!value) return
+            const str = String(value).trim()
+            if (!str) return
+            candidateUrls.push(str)
+        }
+        if (primaryUrl) addCandidate(primaryUrl)
+        if (Array.isArray(evidenceEntry?.affectedUrls)) {
+            evidenceEntry.affectedUrls.forEach(addCandidate)
+        }
+        if (Array.isArray(item?.affectedUrls)) {
+            item.affectedUrls.filter(Boolean).forEach(addCandidate)
+        }
+        addCandidate(evidenceEntry?.context?.url)
+        addCandidate(evidenceEntry?.context?.location)
         if (!candidateUrls.length) return
         const normalizedUrl = canonicalizeIastUrl(primaryUrl || candidateUrls[0])
         if (!normalizedUrl) return
@@ -878,9 +1263,8 @@ function bindRequestList(requests) {
         //$container.append(`<div class="item"><div class="content"><div class="description">No requests captured yet.</div></div></div>`)
         return
     }
-    requests.forEach(req => {
-        $container.append(bindRequest(req))
-    })
+    const html = requests.map(req => bindRequest(req)).join('')
+    $container.html(html)
 }
 
 function buildIastRequestIndex(requests) {
@@ -897,7 +1281,24 @@ function buildIastRequestIndex(requests) {
 
 function mapFindingToRequestKey(finding, requestIndex) {
     if (!finding || !(requestIndex instanceof Map)) return null
-    const primaryUrl = finding?.location?.url || (Array.isArray(finding?.affectedUrls) && finding.affectedUrls.length ? finding.affectedUrls[0] : null) || (Array.isArray(finding?.evidence) ? rutils.resolveIASTLocation(finding, finding.evidence.find(e => e?.source === 'IAST')) : null)
+    const evidenceEntry = extractPrimaryIastEvidence(finding) || {}
+    const candidateUrls = []
+    const addCandidate = (value) => {
+        if (!value) return
+        const str = String(value).trim()
+        if (!str) return
+        candidateUrls.push(str)
+    }
+    addCandidate(finding?.location?.url)
+    if (Array.isArray(evidenceEntry?.affectedUrls)) {
+        evidenceEntry.affectedUrls.forEach(addCandidate)
+    }
+    if (Array.isArray(finding?.affectedUrls)) {
+        finding.affectedUrls.forEach(addCandidate)
+    }
+    addCandidate(evidenceEntry?.context?.url)
+    addCandidate(evidenceEntry?.context?.location)
+    const primaryUrl = candidateUrls.find(Boolean)
     const url = canonicalizeIastUrl(primaryUrl)
     if (!url) return null
     const matches = requestIndex.get(url)
@@ -916,12 +1317,12 @@ function canonicalizeIastUrl(url) {
         return `${parsed.origin}${parsed.pathname}${parsed.search || ''}${parsed.hash || ''}`
     } catch (err) {
         try {
-                const normalized = new URL(url, window.location.href)
-                let pathname = normalized.pathname || '/'
-                pathname = pathname.replace(/\/{2,}/g, '/')
-                if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1)
-                normalized.pathname = pathname
-                return `${normalized.origin}${normalized.pathname}${normalized.search || ''}${normalized.hash || ''}`
+            const normalized = new URL(url, window.location.href)
+            let pathname = normalized.pathname || '/'
+            pathname = pathname.replace(/\/{2,}/g, '/')
+            if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1)
+            normalized.pathname = pathname
+            return `${normalized.origin}${normalized.pathname}${normalized.search || ''}${normalized.hash || ''}`
         } catch (_) {
             return ''
         }
@@ -930,6 +1331,36 @@ function canonicalizeIastUrl(url) {
 
 function canonicalizeRequestKey(rawKey) {
     return rawKey ? String(rawKey) : ''
+}
+
+function escAttrValue(value) {
+    if (value === null || value === undefined) return ""
+    if (window.CSS && typeof CSS.escape === "function") return CSS.escape(String(value))
+    return String(value)
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/[\n\r\t\f\v]/g, " ")
+}
+
+function getIastRequestFilterStyleTag() {
+    let style = document.getElementById("ptkIastRequestFilterStyle")
+    if (!style) {
+        style = document.createElement("style")
+        style.id = "ptkIastRequestFilterStyle"
+        document.head.appendChild(style)
+    }
+    return style
+}
+
+function updateIastRequestFilterStyle(requestKey) {
+    const style = getIastRequestFilterStyleTag()
+    if (!requestKey) {
+        style.textContent = ""
+        return
+    }
+    const escaped = escAttrValue(requestKey)
+    // Keep match rule non-important so scope filters can still hide.
+    style.textContent = `#attacks_info[data-request-key="${escaped}"] .iast_attack_card[data-request-key="${escaped}"] { display:block; }`
 }
 
 function toggleRequestFilter(rawKey) {
@@ -943,12 +1374,14 @@ function toggleRequestFilter(rawKey) {
         return
     }
     iastFilterState.requestKey = key
+    iastRequestFilterDirty = true
     updateRequestFilterActiveState()
     applyIastFilters()
 }
 
 function clearRequestFilter() {
     iastFilterState.requestKey = null
+    iastRequestFilterDirty = true
     updateRequestFilterActiveState()
     applyIastFilters()
 }
@@ -969,30 +1402,23 @@ function updateRequestFilterActiveState() {
     })
     if (key && !found) {
         iastFilterState.requestKey = null
+        iastRequestFilterDirty = true
+        applyIastFilters()
     }
 }
 
 function applyIastFilters() {
     const requestKey = iastFilterState.requestKey
     const scope = iastFilterState.scope
-    const $cards = $('.iast_attack_card')
-    $cards.each(function () {
-        const $card = $(this)
-        const cardKey = $card.attr('data-request-key') || ''
-        const severity = ($card.attr('data-severity') || '').toLowerCase()
-        let visible = true
-        if (requestKey && cardKey !== requestKey) {
-            visible = false
-        }
-        if (visible && scope === 'vuln' && severity === 'info') {
-            visible = false
-        }
-        $card.toggle(visible)
-    })
-    const totalStats = controller._iastBaseStats || collectIastStatsFromElements($cards)
-    const filteredStats = collectIastStatsFromElements($cards.filter(':visible'))
-    const statsToShow = requestKey ? filteredStats : totalStats
-    rutils.bindStats(statsToShow, 'iast')
+    const $container = $("#attacks_info")
+    if (requestKey) {
+        $container.attr("data-request-key", requestKey)
+    } else {
+        $container.removeAttr("data-request-key")
+    }
+    updateIastRequestFilterStyle(requestKey)
+    $container.attr("data-scope", scope)
+    renderIastStatsFromCounters()
 }
 
 $(document).on('click', '.iast-attack-details', function (event) {
@@ -1022,14 +1448,19 @@ function setIastScopeFilter(scope) {
 /* Chrome runtime events handlers */
 ////////////////////////////////////
 browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
-    if (message?.channel === 'ptk_background_iast2popup' && message?.type === 'scan_update') {
-        const info = {
-            scanResult: message.scanResult || {},
-            isScanRunning: !!message.isScanRunning
+    if (message?.channel === 'ptk_background_iast2popup') {
+        if (message?.type === 'scan_update') {
+            const info = {
+                scanResult: message.scanResult || {},
+                isScanRunning: !!message.isScanRunning
+            }
+            changeView(info)
+            if (hasRenderableIastData(info.scanResult)) {
+                bindScanResult(info)
+            }
         }
-        changeView(info)
-        if (hasRenderableIastData(info.scanResult)) {
-            bindScanResult(info)
+        if (message?.type === 'scan_delta') {
+            applyIastScanDelta(message)
         }
     }
 })

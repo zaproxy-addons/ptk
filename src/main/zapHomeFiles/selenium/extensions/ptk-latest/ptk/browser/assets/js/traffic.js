@@ -147,7 +147,11 @@ jQuery(function () {
         $form.form('validate form')
         if ($form.form('is valid')) {
             try {
-                let url = new URL($form.form('get value', 'url'))
+                const rawUrl = $form.form('get value', 'url')
+                if (!rawUrl) {
+                    throw new Error('URL is required')
+                }
+                let url = new URL(rawUrl)
                 controller.start(this.attributes['data-value'].value == 'true', url.toString())
             } catch (e) {
                 $('#traffic_error_message').text("Could start recording " + e.message)

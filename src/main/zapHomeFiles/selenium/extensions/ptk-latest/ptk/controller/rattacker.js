@@ -134,4 +134,23 @@ export class ptk_controller_rattacker {
         }).catch(e => e)
     }
 
+    async exportScanResult(target = "download") {
+        return browser.runtime.sendMessage({
+            channel: "ptk_popup2background_rattacker",
+            type: "export_scan_result",
+            target
+        }).then(response => response)
+            .catch(e => e)
+    }
+
+    async getRequestSnapshot(requestId, attackId = null) {
+        return browser.runtime.sendMessage({
+            channel: "ptk_popup2background_rattacker",
+            type: "get_request_snapshot",
+            requestId,
+            attackId
+        }).then(response => response)
+            .catch(e => e)
+    }
+
 }

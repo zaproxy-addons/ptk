@@ -100,6 +100,46 @@ export class ptk_module {
         return (this._getHeader(schema, 'Content-Type') || schema?.request?.body?.mimeType || '').toLowerCase()
     }
 
+    _getHeaderFromRaw(raw, name) {
+        if (!raw) return null
+        const target = String(name || '').toLowerCase()
+        const lines = String(raw).split(/\r?\n/)
+        for (const line of lines) {
+            const idx = line.indexOf(':')
+            if (idx === -1) continue
+            const hname = line.slice(0, idx).trim().toLowerCase()
+            if (hname === target) {
+                return line.slice(idx + 1).trim()
+            }
+        }
+        return null
+    }
+
+    _extractJwtFromString(value) {
+        if (!value) return null
+        const match = String(value).match(/ey[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_-]*/)
+        return match ? match[0] : null
+    }
+
+    _decodeJwtPayload(token) {
+        if (!token) return null
+        const parts = String(token).split('.')
+        if (parts.length < 2) return null
+        let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+        while (b64.length % 4) b64 += '='
+        try {
+            if (typeof atob === 'function') {
+                return atob(b64)
+            }
+            if (typeof Buffer !== 'undefined') {
+                return Buffer.from(b64, 'base64').toString('utf8')
+            }
+        } catch (_) {
+            return null
+        }
+        return null
+    }
+
     _looksJsonCt(ct) {
         return ct.includes('application/json') || ct.includes('text/json') || ct.includes('+json')
     }
@@ -197,9 +237,9 @@ export class ptk_module {
         let cur = obj
         for (let i = 0; i < segs.length - 1; i++) {
             const k = segs[i]
-            if (cur[k] == null) {
+            const next = segs[i + 1]
+            if (cur[k] == null || typeof cur[k] !== 'object') {
                 // create object or array segment depending on next segment
-                const next = segs[i + 1]
                 cur[k] = (typeof next === 'number') ? [] : {}
             }
             cur = cur[k]
@@ -376,6 +416,8 @@ export class ptk_module {
         if (action.regex) {
             let r = new RegExp(action.regex)
             return String(param ?? '').replace(r, action.value)
+        } else if (action.operation === 'remove') {
+            return ''
         } else if (action.operation === 'add') {
             return (action.position === 'after') ? (String(param ?? '') + action.value) : (action.value + String(param ?? ''))
         } else if (action.operation === 'replace') {
@@ -488,7 +530,7 @@ export class ptk_module {
             }
         }
 
-        if (jsonObj && !Array.isArray(jsonObj)) {
+        if (jsonObj && typeof jsonObj === 'object' && !Array.isArray(jsonObj)) {
             if (!Object.prototype.hasOwnProperty.call(jsonObj, 'ptk_rnd')) {
                 jsonObj['ptk_rnd'] = ptk_utils.attackParamId()
             }
@@ -501,7 +543,7 @@ export class ptk_module {
     // Cookie mutation (atomic or bulk)
     // onlyName: mutate only this cookie (atomic mode)
     modifyCookies(schema, action, onlyName = null, mutations = null) {
-        const cookies = this._ensureCookiesArray(schema)
+        const cookies = this._getCookiesArray(schema)
         const beforeSnapshot = cookies.map(c => ({ name: c.name, value: c.value }))
 
         // Determine cookie actions
@@ -517,18 +559,36 @@ export class ptk_module {
         }
         if (!cookieActs.length && !cookieHeaderAct) return schema
 
+        const removeCookie = (cname, reason, beforeValue) => {
+            const idx = cookies.findIndex(c => (c.name || '').toLowerCase() === (cname || '').toLowerCase())
+            if (idx !== -1) {
+                const before = typeof beforeValue !== 'undefined' ? beforeValue : cookies[idx].value
+                cookies.splice(idx, 1)
+                this._recordMutation(mutations, 'cookie', cname, before, undefined)
+            }
+        }
+
         // Apply per-cookie actions
         const apply = (cname, act) => {
             const idx = cookies.findIndex(c => (c.name || '').toLowerCase() === (cname || '').toLowerCase())
             if (idx === -1) {
                 if (act.name) {
                     const before = undefined
+                    if (act.operation === 'remove') {
+                        return
+                    }
                     const after = this.modifyParam(act.name, '', act)
                     cookies.push({ name: act.name, value: after })
                     this._recordMutation(mutations, 'cookie', act.name, before, after)
                 }
             } else {
                 const before = cookies[idx].value
+                if (act.operation === 'remove') {
+                    const name = cookies[idx].name
+                    cookies.splice(idx, 1)
+                    this._recordMutation(mutations, 'cookie', name || cname, before, undefined)
+                    return
+                }
                 const after = this.modifyParam(cookies[idx].name, cookies[idx].value, act)
                 cookies[idx].value = after
                 this._recordMutation(mutations, 'cookie', cookies[idx].name, before, after)
@@ -536,6 +596,12 @@ export class ptk_module {
         }
 
         for (const act of cookieActs) {
+            if (act.operation === 'remove' && act.regex && !act.name) {
+                const r = new RegExp(act.regex)
+                const toRemove = cookies.filter(c => r.test(String(c.value ?? ''))).map(c => c.name)
+                for (const cname of toRemove) removeCookie(cname, 'regex')
+                continue
+            }
             if (act.name) {
                 if (onlyName && act.name.toLowerCase() !== onlyName.toLowerCase()) continue
                 apply(act.name, act)
@@ -588,6 +654,32 @@ export class ptk_module {
         for (const a of (action.headers || [])) {
             // Skip 'Cookie' here; handled by modifyCookies to track per-cookie names
             if ((a.name || '').toLowerCase() === 'cookie') continue
+
+            if (a.operation === 'remove') {
+                if (a.name) {
+                    for (let i = headers.length - 1; i >= 0; i--) {
+                        if ((headers[i].name || '').toLowerCase() === a.name.toLowerCase()) {
+                            const before = headers[i].value
+                            const name = headers[i].name
+                            headers.splice(i, 1)
+                            this._recordMutation(mutations, 'header', name, before, undefined)
+                        }
+                    }
+                    continue
+                }
+                if (a.regex) {
+                    const r = new RegExp(a.regex)
+                    for (let i = headers.length - 1; i >= 0; i--) {
+                        if (r.test(String(headers[i].value ?? ''))) {
+                            const before = headers[i].value
+                            const name = headers[i].name
+                            headers.splice(i, 1)
+                            this._recordMutation(mutations, 'header', name, before, undefined)
+                        }
+                    }
+                    continue
+                }
+            }
 
             if (a.name) {
                 if (onlyName && a.name.toLowerCase() !== onlyName.toLowerCase()) continue
@@ -828,8 +920,35 @@ export class ptk_module {
             if (executed.metadata?.validation?.proof && success) {
                 proof = jsonLogic.apply(executed.metadata.validation.proof, { "attack": executed, "original": original, "module": this })
             }
-            return { "success": !!success, "proof": proof }
+            if (success && !proof) {
+                proof = this._buildBaselineProof(executed, original)
+            }
+            return {
+                "success": !!success,
+                "proof": proof,
+                "detector": executed.metadata?.validation?.type || executed.metadata?.validation?.detector || null,
+                "match": proof || null
+            }
         }
         return { "success": false, "proof": "" }
+    }
+
+    _buildBaselineProof(attack, original) {
+        const attackRes = attack?.response || {}
+        const origRes = original?.response || {}
+        const statusMatch = attackRes?.statusCode != null && origRes?.statusCode != null
+            && Number(attackRes.statusCode) === Number(origRes.statusCode)
+        const bodyMatch = typeof attackRes?.body === "string" && typeof origRes?.body === "string"
+            && attackRes.body === origRes.body
+        if (statusMatch && bodyMatch) {
+            return "Attack response matches baseline (status and body)."
+        }
+        if (statusMatch) {
+            return "Attack response status matches baseline."
+        }
+        if (bodyMatch) {
+            return "Attack response body matches baseline."
+        }
+        return ""
     }
 }

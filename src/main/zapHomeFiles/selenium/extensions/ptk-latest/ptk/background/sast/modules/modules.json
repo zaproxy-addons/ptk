@@ -17,10 +17,20 @@
         },
         "maxFindings": 100,
         "category": "xss",
-        "owasp": "A03:2021-Injection",
-        "cwe": "CWE-79",
-        "tags": ["sast", "dom", "xss"],
-        "severity": "high"
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2021 - Injection"
+        ],
+        "cwe": [
+          "CWE-79"
+        ],
+        "tags": [
+          "sast",
+          "dom",
+          "xss"
+        ],
+        "severity": "high",
+        "vulnId": "dom_xss"
       },
       "rules": [
         {
@@ -83,7 +93,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["document", "write"]
+                  "member": [
+                    "document",
+                    "write"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -91,7 +104,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["document", "writeln"]
+                  "member": [
+                    "document",
+                    "writeln"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -114,7 +130,9 @@
                 "args": [
                   {
                     "index": 0,
-                    "disallowTypes": ["Literal"]
+                    "disallowTypes": [
+                      "Literal"
+                    ]
                   },
                   {
                     "index": 1,
@@ -128,12 +146,17 @@
             {
               "call": {
                 "callee": {
-                  "member": ["DOMParser", "parseFromString"]
+                  "member": [
+                    "DOMParser",
+                    "parseFromString"
+                  ]
                 },
                 "args": [
                   {
                     "index": 0,
-                    "disallowTypes": ["Literal"]
+                    "disallowTypes": [
+                      "Literal"
+                    ]
                   },
                   {
                     "index": 1,
@@ -161,8 +184,15 @@
                 "left": {
                   "memberAny": {
                     "of": [
-                      ["template", "innerHTML"],
-                      ["*", "template", "innerHTML"]
+                      [
+                        "template",
+                        "innerHTML"
+                      ],
+                      [
+                        "*",
+                        "template",
+                        "innerHTML"
+                      ]
                     ]
                   }
                 }
@@ -172,7 +202,13 @@
               "assignment": {
                 "left": {
                   "memberAny": {
-                    "of": [["*", "content", "innerHTML"]]
+                    "of": [
+                      [
+                        "*",
+                        "content",
+                        "innerHTML"
+                      ]
+                    ]
                   }
                 },
                 "right": {
@@ -195,51 +231,7 @@
           },
           "matches": [
             {
-              "call": {
-                "callee": {
-                  "member": ["*", "setAttribute"]
-                },
-                "args": [
-                  {
-                    "index": 0,
-                    "regex": "^on[a-z]+$",
-                    "flags": "i"
-                  },
-                  {
-                    "index": 1,
-                    "disallowTypes": [
-                      "Literal",
-                      "FunctionExpression",
-                      "ArrowFunctionExpression"
-                    ]
-                  }
-                ],
-                "argIndex": 1
-              }
-            },
-            {
-              "assignment": {
-                "left": {
-                  "memberPropRegex": "^on[a-z]+",
-                  "caseInsensitive": true
-                },
-                "right": {
-                  "binaryExpression": {
-                    "operator": "+"
-                  }
-                }
-              }
-            },
-            {
-              "assignment": {
-                "left": {
-                  "memberPropRegex": "^on[a-z]+",
-                  "caseInsensitive": true
-                },
-                "right": {
-                  "identifierRegex": ".+"
-                }
-              }
+              "custom": "event_handler_string"
             }
           ]
         },
@@ -280,6 +272,12 @@
             "location:self",
             "location:href",
             "location:pathname",
+            "router:snapshot_queryParams",
+            "router:snapshot_queryParams_prop",
+            "router:snapshot_queryParamMap_get",
+            "router:queryParamMap_get",
+            "router:queryParams",
+            "router:queryParams_prop",
             "document:url",
             "document:documentURI",
             "document:baseURI",
@@ -289,7 +287,8 @@
             "document:referrer",
             "window:name",
             "jquery:val_get",
-            "jquery:attr_get"
+            "jquery:attr_get",
+            "http:response"
           ],
           "sinks": [
             "dom:innerHTML",
@@ -333,10 +332,75 @@
             "prop:callback:array_map",
             "prop:callback:array_forEach"
           ],
-          "taint_kinds": ["dom-xss"]
+          "taint_kinds": [
+            "dom-xss"
+          ]
+        },
+        {
+          "mode": "taint",
+          "id": "dom-xss-taint-angular",
+          "name": "DOM XSS via innerHTML (Angular)",
+          "severity": "high",
+          "metadata": {
+            "description": "Detects flows where untrusted DOM-derived data reaches Angular-compiled innerHTML/outerHTML sinks (ɵɵproperty / renderer.setProperty) without sanitization.",
+            "maxFindings": 30,
+            "originLimit": 50
+          },
+          "sources": [
+            "dom:getElementById_value",
+            "dom:qs_value",
+            "location:search",
+            "location:hash",
+            "location:self",
+            "location:href",
+            "location:pathname",
+            "router:snapshot_queryParams",
+            "router:snapshot_queryParams_prop",
+            "router:snapshot_queryParamMap_get",
+            "router:queryParamMap_get",
+            "router:queryParams",
+            "router:queryParams_prop",
+            "document:url",
+            "document:documentURI",
+            "document:baseURI",
+            "document:cookie",
+            "storage:local_getItem",
+            "storage:session_getItem",
+            "document:referrer",
+            "window:name",
+            "jquery:val_get",
+            "jquery:attr_get",
+            "http:response"
+          ],
+          "sinks": [
+            "dom:angular_property_innerHTML",
+            "dom:angular_renderer_setProperty",
+            "dom:angular_bypassSecurityTrust"
+          ],
+          "sanitizers": [
+            "san:dompurify_sanitize",
+            "san:encodeURIComponent",
+            "san:css_escape"
+          ],
+          "propagate": [
+            "prop:assignment:local",
+            "prop:passthrough:identity_strings",
+            "prop:url_ctor",
+            "prop:urlsearchparams_ctor",
+            "prop:urlsearchparams_get",
+            "prop:return:taint",
+            "prop:call:arg_to_param",
+            "prop:return:param_to_ret",
+            "prop:write:param_to_property",
+            "prop:promise:then",
+            "prop:callback:array_map",
+            "prop:callback:array_forEach"
+          ],
+          "taint_kinds": [
+            "dom-xss"
+          ]
         }
-      ],
-      "vulnId": "dom_xss"
+      ]
     },
     {
       "id": "cookie-manipulation",
@@ -351,11 +415,21 @@
           "CWE": "https://cwe.mitre.org/data/definitions/384.html"
         },
         "maxFindings": 100,
-        "category": "session_management",
-        "owasp": "A07:2021-Identification and Authentication Failures",
-        "cwe": "CWE-384",
-        "tags": ["sast", "cookies", "session"],
-        "severity": "medium"
+        "category": "auth_session",
+        "owasp": [
+          "A07:2025 - Authentication Failures",
+          "A07:2021 - Identification and Authentication Failures"
+        ],
+        "cwe": [
+          "CWE-384"
+        ],
+        "tags": [
+          "sast",
+          "cookies",
+          "session"
+        ],
+        "severity": "medium",
+        "vulnId": "auth_failures"
       },
       "rules": [
         {
@@ -371,7 +445,10 @@
             {
               "assignment": {
                 "left": {
-                  "member": ["document", "cookie"]
+                  "member": [
+                    "document",
+                    "cookie"
+                  ]
                 }
               }
             },
@@ -385,7 +462,10 @@
             {
               "assignment": {
                 "left": {
-                  "member": ["document", "cookie"]
+                  "member": [
+                    "document",
+                    "cookie"
+                  ]
                 },
                 "right": {
                   "binaryExpression": {
@@ -423,7 +503,10 @@
             "jquery:val_get",
             "jquery:attr_get"
           ],
-          "sinks": ["dom:document_cookie_write", "cookie:wrapper_setter"],
+          "sinks": [
+            "dom:document_cookie_write",
+            "cookie:wrapper_setter"
+          ],
           "sanitizers": [],
           "propagate": [
             "prop:assignment:local",
@@ -439,10 +522,11 @@
             "prop:urlsearchparams_ctor",
             "prop:urlsearchparams_get"
           ],
-          "taint_kinds": ["cookie-manipulation-taint"]
+          "taint_kinds": [
+            "cookie-manipulation-taint"
+          ]
         }
-      ],
-      "vulnId": "cookie_manipulation"
+      ]
     },
     {
       "id": "open-redirection",
@@ -457,11 +541,20 @@
           "CWE": "https://cwe.mitre.org/data/definitions/601.html"
         },
         "maxFindings": 100,
-        "category": "open_redirect",
-        "owasp": "A01:2021-Broken Access Control",
-        "cwe": "CWE-601",
-        "tags": ["sast", "redirect"],
-        "severity": "medium"
+        "category": "access_control",
+        "owasp": [
+          "A01:2025 - Broken Access Control",
+          "A01:2021 - Broken Access Control"
+        ],
+        "cwe": [
+          "CWE-601"
+        ],
+        "tags": [
+          "sast",
+          "redirect"
+        ],
+        "severity": "medium",
+        "vulnId": "open_redirect"
       },
       "rules": [
         {
@@ -477,7 +570,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["window", "open"]
+                  "member": [
+                    "window",
+                    "open"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -485,7 +581,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["location", "assign"]
+                  "member": [
+                    "location",
+                    "assign"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -493,7 +592,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["location", "replace"]
+                  "member": [
+                    "location",
+                    "replace"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -508,42 +610,61 @@
             {
               "assignment": {
                 "left": {
-                  "member": ["location", "href"]
+                  "member": [
+                    "location",
+                    "href"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["document", "location"]
+                  "member": [
+                    "document",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["window", "document", "location"]
+                  "member": [
+                    "window",
+                    "document",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["top", "location"]
+                  "member": [
+                    "top",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["parent", "location"]
+                  "member": [
+                    "parent",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "call": {
                 "callee": {
-                  "member": ["global", "open"]
+                  "member": [
+                    "global",
+                    "open"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -551,7 +672,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["globalThis", "open"]
+                  "member": [
+                    "globalThis",
+                    "open"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -559,7 +683,11 @@
             {
               "call": {
                 "callee": {
-                  "member": ["global", "location", "assign"]
+                  "member": [
+                    "global",
+                    "location",
+                    "assign"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -567,7 +695,11 @@
             {
               "call": {
                 "callee": {
-                  "member": ["global", "location", "replace"]
+                  "member": [
+                    "global",
+                    "location",
+                    "replace"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -575,7 +707,11 @@
             {
               "call": {
                 "callee": {
-                  "member": ["globalThis", "location", "assign"]
+                  "member": [
+                    "globalThis",
+                    "location",
+                    "assign"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -583,7 +719,11 @@
             {
               "call": {
                 "callee": {
-                  "member": ["globalThis", "location", "replace"]
+                  "member": [
+                    "globalThis",
+                    "location",
+                    "replace"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -591,42 +731,64 @@
             {
               "assignment": {
                 "left": {
-                  "member": ["global", "location", "href"]
+                  "member": [
+                    "global",
+                    "location",
+                    "href"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["globalThis", "location", "href"]
+                  "member": [
+                    "globalThis",
+                    "location",
+                    "href"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["global", "document", "location"]
+                  "member": [
+                    "global",
+                    "document",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["globalThis", "document", "location"]
+                  "member": [
+                    "globalThis",
+                    "document",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["global", "location"]
+                  "member": [
+                    "global",
+                    "location"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["globalThis", "location"]
+                  "member": [
+                    "globalThis",
+                    "location"
+                  ]
                 }
               }
             }
@@ -641,21 +803,30 @@
             {
               "assignment": {
                 "left": {
-                  "member": ["location", "search"]
+                  "member": [
+                    "location",
+                    "search"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["location", "pathname"]
+                  "member": [
+                    "location",
+                    "pathname"
+                  ]
                 }
               }
             },
             {
               "assignment": {
                 "left": {
-                  "member": ["location", "protocol"]
+                  "member": [
+                    "location",
+                    "protocol"
+                  ]
                 }
               }
             }
@@ -728,10 +899,11 @@
             "prop:callback:array_forEach",
             "prop:callback:addEventListener"
           ],
-          "taint_kinds": ["open-redirection-taint"]
+          "taint_kinds": [
+            "open-redirection-taint"
+          ]
         }
-      ],
-      "vulnId": "open_redirect"
+      ]
     },
     {
       "id": "javascript-injection",
@@ -746,11 +918,21 @@
           "CWE": "https://cwe.mitre.org/data/definitions/94.html"
         },
         "maxFindings": 100,
-        "category": "code_injection",
-        "owasp": "A03:2021-Injection",
-        "cwe": "CWE-94",
-        "tags": ["sast", "javascript", "code"],
-        "severity": "high"
+        "category": "injection",
+        "owasp": [
+          "A05:2025 - Injection",
+          "A03:2021 - Injection"
+        ],
+        "cwe": [
+          "CWE-94"
+        ],
+        "tags": [
+          "sast",
+          "javascript",
+          "code"
+        ],
+        "severity": "high",
+        "vulnId": "code_injection"
       },
       "rules": [
         {
@@ -808,7 +990,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["window", "setTimeout"]
+                  "member": [
+                    "window",
+                    "setTimeout"
+                  ]
                 },
                 "argIndex": 0,
                 "args": [
@@ -822,7 +1007,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["window", "setInterval"]
+                  "member": [
+                    "window",
+                    "setInterval"
+                  ]
                 },
                 "argIndex": 0,
                 "args": [
@@ -836,7 +1024,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["window", "setImmediate"]
+                  "member": [
+                    "window",
+                    "setImmediate"
+                  ]
                 },
                 "argIndex": 0,
                 "args": [
@@ -870,7 +1061,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["window", "execScript"]
+                  "member": [
+                    "window",
+                    "execScript"
+                  ]
                 },
                 "argIndex": 0
               }
@@ -904,7 +1098,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["window", "eval"]
+                  "member": [
+                    "window",
+                    "eval"
+                  ]
                 },
                 "argIndex": 0,
                 "args": [
@@ -918,7 +1115,10 @@
             {
               "call": {
                 "callee": {
-                  "member": ["globalThis", "eval"]
+                  "member": [
+                    "globalThis",
+                    "eval"
+                  ]
                 },
                 "argIndex": 0,
                 "args": [
@@ -993,6 +1193,7 @@
             "js:Function_constructor_body",
             "js:execScript",
             "jquery:globalEval_getScript",
+            "ajax:jquery_globalEval",
             "dom:execCommand",
             "dom:createContextualFragment",
             "crypto:generateCRMFRequest",
@@ -1013,10 +1214,11 @@
             "prop:urlsearchparams_ctor",
             "prop:urlsearchparams_get"
           ],
-          "taint_kinds": ["javascript-injection-taint"]
+          "taint_kinds": [
+            "javascript-injection-taint"
+          ]
         }
-      ],
-      "vulnId": "js_injection"
+      ]
     }
   ]
 }

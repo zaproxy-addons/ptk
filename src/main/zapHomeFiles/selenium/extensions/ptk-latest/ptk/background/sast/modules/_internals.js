@@ -86,6 +86,149 @@ function _nodeToStaticString(node) {
   return null;
 }
 
+function _isStaticStringLiteral(node) {
+  if (!node) return false;
+  if (node.type === "Literal") return typeof node.value === "string";
+  if (node.type === "StringLiteral") return true;
+  return false;
+}
+
+function _isStableMemberProperty(node) {
+  if (!node || node.type !== "MemberExpression") return false;
+  if (!node.computed) return true;
+  return _isStaticStringLiteral(node.property);
+}
+
+function _isDocumentReceiver(node) {
+  if (!node) return false;
+  if (node.type === "Identifier") return node.name === "document";
+  if (node.type === "MemberExpression") {
+    return _matchMemberChain(node, ["window", "document"]);
+  }
+  return false;
+}
+
+function _isJqueryCallee(callee) {
+  if (!callee) return false;
+  if (callee.type === "Identifier") {
+    return callee.name === "$" || callee.name === "jQuery";
+  }
+  if (callee.type === "MemberExpression") {
+    return _matchMemberChain(callee, ["window", "$"]) ||
+      _matchMemberChain(callee, ["window", "jQuery"]) ||
+      _matchMemberChain(callee, ["globalThis", "$"]) ||
+      _matchMemberChain(callee, ["globalThis", "jQuery"]);
+  }
+  return false;
+}
+
+function _isJqueryChain(node, depth = 0) {
+  if (!node || depth > 3) return false;
+  if (node.type === "CallExpression") {
+    if (_isJqueryCallee(node.callee)) return true;
+    if (node.callee?.type === "MemberExpression") {
+      const prop = _memberPropertyName(node.callee);
+      if ((prop === "find" || prop === "on") && _isJqueryChain(node.callee.object, depth + 1)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function isStringIshExpression(expr) {
+  if (!expr) return false;
+  if (expr.type === "Literal") return typeof expr.value === "string";
+  if (expr.type === "StringLiteral") return true;
+  if (expr.type === "TemplateLiteral") return true;
+  if (expr.type === "Identifier") return true;
+  if (expr.type === "BinaryExpression" && expr.operator === "+") {
+    return isStringIshExpression(expr.left) || isStringIshExpression(expr.right);
+  }
+  return false;
+}
+
+export function isOnEventProperty(memberExpr) {
+  if (!memberExpr || memberExpr.type !== "MemberExpression") return false;
+  if (!_isStableMemberProperty(memberExpr)) return false;
+  const prop = _memberPropertyName(memberExpr);
+  if (!prop) return false;
+  return /^on[a-z]+$/i.test(String(prop));
+}
+
+export function getEventHandlerSink(node) {
+  if (!node) return null;
+  if (node.type === "CallExpression") {
+    const callee = node.callee;
+    if (!callee || callee.type !== "MemberExpression") return null;
+    if (!_isStableMemberProperty(callee)) return null;
+    const prop = _memberPropertyName(callee);
+    if (prop !== "setAttribute") return null;
+    const nameNode = node.arguments?.[0];
+    const valueNode = node.arguments?.[1];
+    const name = _nodeToStaticString(nameNode);
+    if (!name || !/^on[a-z]+$/i.test(String(name))) return null;
+    if (!isStringIshExpression(valueNode)) return null;
+    return { api: "setAttribute", eventName: String(name), valueNode };
+  }
+  if (node.type === "AssignmentExpression") {
+    const left = node.left;
+    if (!left || left.type !== "MemberExpression") return null;
+    if (!isOnEventProperty(left)) return null;
+    const valueNode = node.right;
+    if (!isStringIshExpression(valueNode)) return null;
+    const prop = _memberPropertyName(left);
+    return { api: "property", eventName: String(prop || ""), valueNode };
+  }
+  return null;
+}
+
+export function isDomSelectorCall(node) {
+  if (!node || node.type !== "CallExpression") return null;
+  const callee = node.callee;
+  if (!callee) return null;
+  if (_isJqueryCallee(callee)) {
+    return { api: "jquery_root", argIndex: 0 };
+  }
+  if (callee.type !== "MemberExpression") return null;
+  if (!_isStableMemberProperty(callee)) return null;
+  const prop = _memberPropertyName(callee);
+  if (!prop) return null;
+
+  const documentOnly = new Set([
+    "getElementById",
+    "getElementsByClassName",
+    "getElementsByTagName"
+  ]);
+  const queryMethods = new Set(["querySelector", "querySelectorAll"]);
+  const elementOnly = new Set(["closest", "matches"]);
+  const jqueryOnly = new Set(["find", "on"]);
+
+  const receiver = callee.object;
+  const isElementReceiver = receiver &&
+    (receiver.type === "Identifier" || receiver.type === "MemberExpression" || receiver.type === "ThisExpression");
+
+  if (documentOnly.has(prop)) {
+    if (_isDocumentReceiver(receiver)) return { api: prop, argIndex: 0 };
+    return null;
+  }
+  if (queryMethods.has(prop)) {
+    if (_isDocumentReceiver(receiver) || isElementReceiver) return { api: prop, argIndex: 0 };
+    return null;
+  }
+  if (elementOnly.has(prop)) {
+    if (isElementReceiver) return { api: prop, argIndex: 0 };
+    return null;
+  }
+  if (jqueryOnly.has(prop)) {
+    if (_isJqueryChain(receiver)) {
+      return { api: prop, argIndex: prop === "on" ? 1 : 0 };
+    }
+    return null;
+  }
+  return null;
+}
+
 function _matchCallee(callee, spec) {
   if (!callee || !spec) return false;
   if (spec.identifier || spec.name) {
@@ -113,6 +256,15 @@ function _matchCallee(callee, spec) {
 export function compilePattern(pattern) {
   try {
     const testers = [];
+
+    if (pattern.custom) {
+      const name = pattern.custom;
+      testers.push((node) => {
+        if (name === "dom_selector") return !!isDomSelectorCall(node);
+        if (name === "event_handler_string") return !!getEventHandlerSink(node);
+        return false;
+      });
+    }
 
     if (pattern.identifier || pattern.identifierRegex) {
       const name = pattern.identifier;
@@ -190,6 +342,21 @@ export function compilePattern(pattern) {
       testers.push((node) => {
         if (!node || node.type !== "MemberExpression") return false;
         return _matchMemberChain(node, m);
+      });
+    }
+
+    if (pattern.await) {
+      testers.push((node) => {
+        if (!node || node.type !== "AwaitExpression") return false;
+        return true;
+      });
+    }
+
+    if (pattern.memberAny?.of && Array.isArray(pattern.memberAny.of)) {
+      const candidates = pattern.memberAny.of;
+      testers.push((node) => {
+        if (!node || node.type !== "MemberExpression") return false;
+        return candidates.some((cand) => _matchMemberChain(node, cand));
       });
     }
 
@@ -288,6 +455,7 @@ export class TaintGraph {
     this._edges = new Map();            // toId -> [{ fromNodeId, edgeKind, meta }]
     this._origins = new Map();          // nodeId -> Set(originId)
     this._sanitizers = new Map();       // nodeId -> Set(sanitizerId)
+    this._sourceNodes = new Set();      // nodeId -> explicit source origin
   }
 
   nodeIdForAstNode(node) {
@@ -322,11 +490,22 @@ export class TaintGraph {
     this._edges.get(toId).push(entry);
 
     // propagate origins
+    if (this._sourceNodes.has(toId)) return;
     const fromOrigins = this._origins.get(fromId);
     if (fromOrigins && fromOrigins.size) {
       const merged = this._mergeOriginSets(this._origins.get(toId), fromOrigins);
       if (merged) this._origins.set(toId, merged);
     }
+  }
+
+  markNodeAsSource(nodeId) {
+    if (nodeId == null) return;
+    this._sourceNodes.add(nodeId);
+    this._origins.delete(nodeId);
+  }
+
+  isSourceNode(nodeId) {
+    return this._sourceNodes.has(nodeId);
   }
 
   getUpstream(nodeId) {

@@ -19,8 +19,8 @@ runtime?.onMessage.addListener((msg, sender, sendResponse) => {
   const { type, scanId } = msg;
 
   if (type === "start_scan") {
-    const { policy, opts } = msg;
-    sastWorker.postMessage({ type, scanId, policy, opts });
+    const { scanStrategy, policy, opts } = msg;
+    sastWorker.postMessage({ type, scanId, scanStrategy, policy, opts });
     sendResponse?.({ ok: true });
     return true;
   }

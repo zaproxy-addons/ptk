@@ -61,8 +61,8 @@
         "format": "xml",
         "min_duration": 3000,
         "enable_extra_delay": false,
-        "element_path": "id",
-        "event_type": "javascript",
+        "element_path": "css",
+        "event_type": "driverclick",
         "enable_regex": false,
         "validate_regex": "(sign|log)[ -]?(out|off)"
     },

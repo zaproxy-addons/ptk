@@ -1,8 +1,17 @@
 /* Author: Denis Podgurskii */
 import { ptk_controller_index } from "../../../controller/index.js"
+import { ptk_controller_rattacker } from "../../../controller/rattacker.js"
+import { ptk_controller_iast } from "../../../controller/iast.js"
+import { ptk_controller_sast } from "../../../controller/sast.js"
+import { ptk_controller_sca } from "../../../controller/sca.js"
 import { ptk_utils, ptk_jwtHelper } from "../../../background/utils.js"
+import * as rutils from "../js/rutils.js"
 import CryptoES from '../../../packages/crypto-es/index.js'
 const controller = new ptk_controller_index()
+const dastController = new ptk_controller_rattacker()
+const iastController = new ptk_controller_iast()
+const sastController = new ptk_controller_sast()
+const scaController = new ptk_controller_sca()
 const jwtHelper = new ptk_jwtHelper()
 var tokens = new Array()
 var tokenAdded = false
@@ -26,6 +35,210 @@ function setRunCveState(enabled, { updateUi = true } = {}) {
 
 function isRunCveEnabled() {
     return !!runCveState
+}
+
+function downloadScanExport(scanResult, filename) {
+    if (!scanResult) return false
+    let blob = new Blob([JSON.stringify(scanResult)], { type: 'text/plain' })
+    let downloadLink = document.createElement("a")
+    downloadLink.download = filename
+    downloadLink.innerHTML = "Download File"
+    downloadLink.href = window.URL.createObjectURL(blob)
+    downloadLink.click()
+    return true
+}
+
+function updateManageScanActions(scans) {
+    const isRunning = !!(scans?.dast || scans?.iast || scans?.sast || scans?.sca)
+    const exportable = scans?.exportable || {}
+    const anyExportable = Object.values(exportable).some(Boolean)
+    $('#stop_all_scans').toggleClass('disabled', !isRunning)
+    $('#export_all_scans').toggleClass('disabled', isRunning || !anyExportable)
+}
+
+function applyDashboardScanControls(scans) {
+    if (!scans || typeof scans !== 'object') return
+    updateManageScanActions(scans)
+    changeScanView({ scans })
+    $('#manage_scans').removeClass('disabled')
+    updateGenerateReport(scans)
+}
+
+function hasDashboardCardData() {
+    const tab = controller.tab || {}
+    const hasTech = Array.isArray(tab.technologies) && tab.technologies.length > 0
+    const hasWaf = Array.isArray(tab.waf) ? tab.waf.length > 0 : !!tab.waf
+    const hasCves = Array.isArray(tab.cves) && tab.cves.length > 0
+    const hasHeaders = tab.requestHeaders && Object.keys(tab.requestHeaders).length > 0
+    const hasOwasp = Array.isArray(tab.findings) && tab.findings.length > 0
+    const hasStorage = controller.storage && Object.keys(controller.storage).length > 0
+    const hasTabStorage = tab.storage && Object.keys(tab.storage).length > 0
+    return hasTech || hasWaf || hasCves || hasHeaders || hasOwasp || hasStorage || hasTabStorage
+}
+
+function updateGenerateReport(scans) {
+    const hasScan = !!(scans?.hasAnyScanForHost || scans?.exportable?.any)
+    const enabled = hasDashboardCardData() || hasScan
+    $('#generate_report').toggleClass('disabled', !enabled)
+}
+
+function clearDataTable(selector) {
+    if (!$.fn.dataTable.isDataTable(selector)) return
+    const table = $(selector).DataTable()
+    table.clear().draw(false)
+}
+
+function resetDashboardCardsForTabChange() {
+    controller.tab = {}
+    controller.storage = null
+    controller.cookies = {}
+    controller._headersSig = null
+    controller._lastHeadersRequestId = null
+    tokens = []
+    tokenAdded = false
+    $('#jwt_btn').hide()
+    clearDataTable('#tbl_technologies')
+    clearDataTable('#tbl_cves')
+    clearDataTable('#tbl_owasp')
+    clearDataTable('#tbl_headers')
+    clearDataTable('#tbl_storage')
+    clearDataTable('#tbl_cookie')
+    $('.loader.owasp').show()
+    $('.loader.technologies').show()
+    $('.loader.cves').show()
+    $('.loader.storage').show()
+    updateGenerateReport(controller.scans)
+}
+
+function requestTabAnalysisOnce() {
+    if (controller._analysisRequested) return
+    controller._analysisRequested = true
+    controller.requestTabAnalysis(controller.tabId, controller.url).catch(() => {})
+}
+
+async function resolveActiveTab(result) {
+    if (result?.activeTab?.url && typeof result?.activeTab?.tabId !== 'undefined' && !isExtensionUrl(result.activeTab.url)) {
+        return result.activeTab
+    }
+    try {
+        const tabs = await browser.tabs.query({ currentWindow: true })
+        const active = tabs && tabs.length ? tabs.find((tab) => tab.active) : null
+        if (active?.url && typeof active?.id !== 'undefined' && !isExtensionUrl(active.url)) {
+            return { url: active.url, tabId: active.id }
+        }
+        if (controller._lastAppTabId) {
+            const last = tabs.find((tab) => tab.id === controller._lastAppTabId)
+            if (last?.url && !isExtensionUrl(last.url)) {
+                return { url: last.url, tabId: last.id }
+            }
+        }
+        const fallback = tabs.find((tab) => tab?.url && !isExtensionUrl(tab.url))
+        if (fallback?.url && typeof fallback?.id !== 'undefined') {
+            return { url: fallback.url, tabId: fallback.id }
+        }
+    } catch (_) { }
+    return null
+}
+
+function isExtensionUrl(url) {
+    if (!url) return false
+    const base = browser.runtime.getURL('')
+    return url.startsWith(base)
+}
+
+function setReloadWarning($el, show) {
+    if (!$el || !$el.length) return
+    if ($el.is('#ptk_reload_warning') && window._ptkReloadWarningClosed) return
+    if (show) $el.show()
+    else $el.hide()
+}
+
+function updateRuntimeScanToggles(isContentReady) {
+    const disabled = !isContentReady
+    const $iast = $('#index_scans_form .iast_scan')
+    const $sast = $('#index_scans_form .sast_scan')
+    $iast.toggleClass('disabled', disabled)
+    $iast.find('input').prop('disabled', disabled)
+    $sast.toggleClass('disabled', disabled)
+    $sast.find('input').prop('disabled', disabled)
+}
+
+async function updateDashboardReloadWarning(result) {
+    if (controller.tabId) {
+        const cachedReady = controller._contentReadyByTabId?.[controller.tabId]
+        if (cachedReady === true) {
+            setReloadWarning($('#ptk_reload_banner'), false)
+            return true
+        }
+        if (cachedReady === false) {
+            setReloadWarning($('#ptk_reload_banner'), true)
+            return false
+        }
+        const ready = await rutils.pingContentScript(controller.tabId, { timeoutMs: 700 })
+        controller._contentReadyByTabId = controller._contentReadyByTabId || {}
+        controller._contentReadyByTabId[controller.tabId] = ready
+        if (ready) {
+            setReloadWarning($('#ptk_reload_banner'), false)
+            return true
+        }
+    }
+    const activeTab = await resolveActiveTab(result)
+    if (!activeTab?.tabId) {
+        setReloadWarning($('#ptk_reload_banner'), false)
+        return false
+    }
+    controller.tabId = activeTab.tabId
+    if (activeTab.url && !isExtensionUrl(activeTab.url)) {
+        controller._lastAppTabId = activeTab.tabId
+        controller._lastAppTabUrl = activeTab.url
+    }
+    controller._contentReadyByTabId = controller._contentReadyByTabId || {}
+    const ready = await rutils.pingContentScript(activeTab.tabId, { timeoutMs: 700 })
+    controller._contentReadyByTabId[activeTab.tabId] = ready
+    if (window._ptkReloadBannerClosed) {
+        return ready
+    }
+    setReloadWarning($('#ptk_reload_banner'), !ready)
+    return ready
+}
+
+function nextHeadersRequestId() {
+    const next = (controller._headersRequestCounter || 0) + 1
+    controller._headersRequestCounter = next
+    return `hdr-${Date.now()}-${next}`
+}
+
+function requestHeadersRefresh(tabId) {
+    if (!tabId) return
+    const requestId = nextHeadersRequestId()
+    controller._lastHeadersRequestId = requestId
+    controller.tabId = tabId
+    browser.runtime.sendMessage({
+        channel: "ptk_popup2background_dashboard",
+        type: "headers_refresh",
+        tabId,
+        requestId
+    }).catch(() => {})
+}
+
+function clearContentTimeout(tabId) {
+    if (!tabId || !controller._contentTimeoutByTabId) return
+    const handle = controller._contentTimeoutByTabId[tabId]
+    if (handle) {
+        clearTimeout(handle)
+        delete controller._contentTimeoutByTabId[tabId]
+    }
+}
+
+function scheduleNoAccessFallback(tabId, delayMs = 2500) {
+    if (!tabId) return
+    controller._contentTimeoutByTabId = controller._contentTimeoutByTabId || {}
+    clearContentTimeout(tabId)
+    controller._contentTimeoutByTabId[tabId] = setTimeout(() => {
+        const ready = controller._contentReadyByTabId?.[tabId]
+        if (ready === false) return
+        $('.loader.storage').hide()
+    }, delayMs)
 }
 
 
@@ -70,8 +283,19 @@ jQuery(function () {
 
     })
 
+    $('#ptk_reload_banner_close').on('click', function () {
+        window._ptkReloadBannerClosed = true
+        $('#ptk_reload_banner').hide()
+    })
 
-    $('.menu .item').tab()
+    $('#ptk_reload_warning_close').on('click', function () {
+        window._ptkReloadWarningClosed = true
+        $('#ptk_reload_warning').hide()
+    })
+
+
+    // Bind Semantic UI tabs only to elements that declare a data-tab (avoid hijacking top nav links).
+    $('.menu .item[data-tab]').tab()
     $('#versionInfo').text(browser.runtime.getManifest().version)
 
     // $("#waf_wrapper").on("click", function () {
@@ -89,21 +313,41 @@ jQuery(function () {
 
     $(document).on("click", "#generate_report", function () {
         let report = document.getElementById("main").outerHTML
-
         let enc = CryptoES.enc.Base64.stringify(CryptoES.enc.Utf8.parse(report))
+        const openReport = () => {
+            const url = browser.runtime.getURL("/ptk/browser/report.html?full_report")
+            return browser.windows.create({ type: 'popup', url }).catch(() => {
+                return browser.tabs.create({ url })
+            })
+        }
+        const activeTabId = controller.tabId
+        const tabHasId = controller.tab && controller.tab.tabId
+        const tabMatches = tabHasId ? (controller.tab.tabId === activeTabId) : !!controller.tab
+        const tabData = tabMatches ? controller.tab : {}
+        const cookies = tabMatches ? (controller.cookies || {}) : {}
+        const storage = tabMatches ? (tabData.storage || controller.storage || {}) : {}
+        const requestHeaders = tabMatches ? (tabData.requestHeaders || controller.tab?.requestHeaders || {}) : {}
+        const findings = tabMatches ? (tabData.findings || controller.tab?.findings || []) : []
+        const technologies = tabMatches ? (tabData.technologies || controller.tab?.technologies || []) : []
+        const cves = tabMatches ? (tabData.cves || controller.tab?.cves || []) : []
+        const waf = tabMatches ? (tabData.waf || controller.tab?.waf || null) : null
         browser.storage.local.set({
             "tab_full_info":
             {
-                "technologies": controller.tab.technologies,
-                "waf": controller.tab.waf,
-                "cves": controller.tab.cves
+                "tabId": activeTabId,
+                "url": controller.url,
+                "technologies": technologies,
+                "waf": waf,
+                "cves": cves,
+                "findings": findings,
+                "requestHeaders": requestHeaders,
+                "storage": storage,
+                "cookies": cookies
             }
-        }).then(function (res) {
-            browser.windows.create({
-                type: 'popup',
-                url: browser.runtime.getURL("/ptk/browser/report.html?full_report")
-            })
-
+        }).then(function () {
+            return openReport()
+        }).catch(() => {
+            return openReport()
         })
         return false
 
@@ -115,19 +359,120 @@ jQuery(function () {
     bindTable('#tbl_owasp', { "columns": [{ width: "100%" }] })
     bindTable('#tbl_storage', { "columns": [{ width: "90%" }, { width: "10%", className: 'dt-body-center' }] })
 
-    setTimeout(function () {
-        controller.init().then((result) => {
+    function handleDashboardInit(result, activeTab) {
             if (result.redirect) {
                 location.href = result.redirect
             }
-            //console.log (result)
+            if (activeTab && !result.activeTab) {
+                result.activeTab = activeTab
+            }
+            controller._lite = !!result.lite
+            applyDashboardScanControls(result.scans)
+            let contentReadyPromise = updateDashboardReloadWarning(result).then((ready) => {
+                if (controller.tabId) {
+                    scheduleNoAccessFallback(controller.tabId)
+                    requestHeadersRefresh(controller.tabId)
+                }
+                if (ready === false) {
+                    $('.loader.technologies').hide()
+                    $('.loader.cves').hide()
+                }
+                return ready
+            }).catch(() => false)
             bindInfo()
-            bindOWASP()
+            if (controller.tab) {
+                if (!controller.storage && controller.tab.storage) {
+                    controller.storage = controller.tab.storage
+                }
+                if (Array.isArray(controller.tab.findings) && controller.tab.findings.length) {
+                    bindOWASP()
+                } else if (!controller._lite) {
+                    bindOWASP()
+                } else {
+                    $('.loader.owasp').hide()
+                }
+                if (controller.tab.requestHeaders && Object.keys(controller.tab.requestHeaders).length) {
+                    bindHeaders()
+                }
+                const hasTech = Array.isArray(controller.tab.technologies) && controller.tab.technologies.length
+                const hasCves = Array.isArray(controller.tab.cves) && controller.tab.cves.length
+                const cacheUpdatedAt = result?.tabCacheUpdatedAt ? Number(result.tabCacheUpdatedAt) : 0
+                const cacheStale = cacheUpdatedAt ? (Date.now() - cacheUpdatedAt) > 60000 : true
+                if (hasTech) {
+                    bindTechnologies()
+                }
+                if (hasCves) {
+                    bindCVEs()
+                }
+                const needsRefresh = !hasTech || !hasCves || cacheStale
+                if (needsRefresh) {
+                    contentReadyPromise.then((ready) => {
+                        if (ready === false) return
+                        $('.loader.technologies').show()
+                        $('.loader.cves').show()
+                        requestTabAnalysisOnce()
+                        window._ptkAnalysisTimeout = setTimeout(() => {
+                            $('.loader.technologies').hide()
+                            $('.loader.cves').hide()
+                        }, 5000)
+                    }).catch(() => {})
+                } else if (!hasTech) {
+                    $('.loader.technologies').hide()
+                } else if (!hasCves) {
+                    $('.loader.cves').hide()
+                }
+                if (controller.storage && Object.keys(controller.storage).length) {
+                    bindStorage()
+                } else {
+                    $('.loader.storage').hide()
+                    contentReadyPromise.then((ready) => {
+                        if (ready === false) return
+                        requestTabAnalysisOnce()
+                    }).catch(() => {})
+                }
+            } else if (!controller._lite) {
+                bindOWASP()
+                // Hide other loaders since there's no tab data
+                $('.loader.technologies').hide()
+                $('.loader.cves').hide()
+                $('.loader.storage').hide()
+            } else {
+                contentReadyPromise.then((ready) => {
+                    if (ready === false) return
+                    requestTabAnalysisOnce()
+                    window._ptkAnalysisTimeout = setTimeout(() => {
+                        $('.loader.technologies').hide()
+                        $('.loader.cves').hide()
+                    }, 5000)
+                }).catch(() => {})
+                $('.loader.storage').hide()
+                $('.loader.owasp').hide()
+            }
+    }
 
+    setTimeout(function () {
+        resolveActiveTab().then((activeTab) => {
+            const initOpts = activeTab?.tabId ? { tabId: activeTab.tabId, url: activeTab.url } : {}
+            return controller.init(initOpts).then((result) => handleDashboardInit(result, activeTab))
+        }).catch(() => {
+            controller.init().then((result) => handleDashboardInit(result, null)).catch(() => {})
         })
     }, 150)
 
     setupCardToggleHandlers()
+
+    rutils.registerDashboardTabListener({
+        onTabChange: ({ tabId, url }) => {
+            if (controller.tabId === tabId && controller.url === url) return
+            resetDashboardCardsForTabChange()
+            controller.tabId = tabId
+            controller.url = url
+            controller._lastAppTabId = tabId
+            controller._lastAppTabUrl = url
+            rutils.updateDashboardTab(tabId, url)
+            controller.init({ tabId, url }).then((result) => handleDashboardInit(result, { tabId, url })).catch(() => {})
+        }
+    })
 })
 
 
@@ -138,8 +483,9 @@ jQuery(function () {
 
 async function bindInfo() {
     if (controller.url) {
-        $('#dashboard_message_text').text(controller.url)
-        if (!controller.privacy.enable_cookie) {
+        const baseText = controller.url
+        $('#dashboard_message_text').text(baseText)
+        if (!controller.privacy?.enable_cookie) {
             $('.dropdown.item.notifications').show()
         }
     } else {
@@ -148,6 +494,10 @@ async function bindInfo() {
 }
 
 async function bindOWASP() {
+    if (controller._lite && !(Array.isArray(controller.tab?.findings) && controller.tab.findings.length)) {
+        $('.loader.owasp').hide()
+        return
+    }
     let raw = controller.tab?.findings ? controller.tab.findings : new Array()
     let dt = raw.map(item => [item[0]])
     let params = { "data": dt, "columns": [{ width: "100%" }] }
@@ -159,6 +509,7 @@ async function bindOWASP() {
     let table = bindTable('#tbl_owasp', params)
     table.columns.adjust().draw()
     $('.loader.owasp').hide()
+    updateGenerateReport(controller.scans)
 }
 
 function bindCookies() {
@@ -232,15 +583,19 @@ function bindHeaders() {
             tokens.push(['headers', '<pre>' + JSON.stringify(jwt["payload"], null, 2) + '</pre>', jwtToken[1]])
         }
         bindTokens()
+        updateGenerateReport(controller.scans)
     }
 }
 
-async function bindTechnologies() {
+async function bindTechnologies(force = false) {
     let dt = new Array()
     if (controller.tab.technologies)
         Object.values(controller.tab.technologies).forEach(item => {
             dt.push([item.name, item.version, item.category || ''])
         })
+    if (!dt.length && !force) {
+        return
+    }
     const priority = (category) => {
         const value = (category || '').toLowerCase()
         if (value.includes('waf')) {
@@ -262,9 +617,10 @@ async function bindTechnologies() {
 
     bindTable('#tbl_technologies', params)
     $('.loader.technologies').hide()
+    updateGenerateReport(controller.scans)
 }
 
-async function bindCVEs() {
+async function bindCVEs(force = false) {
     let dt = new Array()
     if (Array.isArray(controller.tab?.cves)) {
         controller.tab.cves.forEach(item => {
@@ -279,9 +635,13 @@ async function bindCVEs() {
             ])
         })
     }
+    if (!dt.length && !force) {
+        return
+    }
     let params = { "data": dt }
     bindTable('#tbl_cves', params)
     $('.loader.cves').hide()
+    updateGenerateReport(controller.scans)
 }
 
 async function bindTokens(data) {
@@ -298,7 +658,13 @@ async function bindTokens(data) {
 
 
 
-function bindStorage() {
+function bindStorage(force = false) {
+    if (!controller.storage) {
+        if (force) {
+            $('.loader.storage').hide()
+        }
+        return
+    }
     let dt = new Array()
     Object.keys(controller.storage).forEach(key => {
         let item = JSON.parse(controller.storage[key])
@@ -309,19 +675,25 @@ function bindStorage() {
             dt.push([key, link])
         }
     })
-    let existingRows = $('#tbl_storage').DataTable().rows().data()
-    for (let i = 0; i < dt.length; i++) {
-        let add = true
-        for (let j = 0; j < existingRows.length; j++) {
-            if (dt[i][0] == existingRows[j][0]) add = false
-        }
-
-        if (add)
-            $('#tbl_storage').DataTable().row.add([dt[i][0], dt[i][1]]).draw()
+    // Use Set for O(1) lookup instead of O(n) nested loop
+    const table = $('#tbl_storage').DataTable()
+    const existingRows = table.rows().data()
+    const existingKeys = new Set()
+    for (let j = 0; j < existingRows.length; j++) {
+        existingKeys.add(existingRows[j][0])
     }
-    $('.loader.storage').hide()
+
+    // Filter to only new rows, then batch add
+    const newRows = dt.filter(row => !existingKeys.has(row[0]))
+    if (newRows.length > 0) {
+        table.rows.add(newRows).draw(false) // false = maintain scroll position
+    }
+    if (dt.length || force) {
+        $('.loader.storage').hide()
+    }
 
     bindTokens()
+    updateGenerateReport(controller.scans)
 }
 
 $(document).on("bind_localStorage", function (e, item) {
@@ -336,6 +708,19 @@ $(document).on("bind_localStorage", function (e, item) {
         $('#localStorageText').text(output.replace(/\\r?\\n/g, '<br/>'))
     }
 })
+
+async function loadFullDashboard() {
+    const result = await controller.getFullDashboard()
+    controller._lite = false
+    bindInfo()
+    bindOWASP()
+    bindHeaders()
+    bindTechnologies()
+    bindCVEs()
+    bindStorage()
+    bindCookies()
+    return result
+}
 
 $(document).on("bind_sessionStorage", function (e, item) {
     if (Object.keys(item).length > 0) {
@@ -478,67 +863,122 @@ $(document).on("click", ".dast_scan_stop, .iast_scan_stop, .sast_scan_stop, .sca
         sca: $(this).hasClass('sca_scan_stop') ? true : false,
     }
     controller.stopBackroungScan(s).then(function (result) {
-        changeScanView(result)
+        applyDashboardScanControls(result?.scans)
     }).catch(e => {
         console.log(e)
     })
 })
 
+$(document).on("click", "#stop_all_scans", function () {
+    if ($(this).hasClass('disabled')) return false
+    const s = { dast: true, iast: true, sast: true, sca: true }
+    controller.stopBackroungScan(s).then(function (result) {
+        applyDashboardScanControls(result?.scans)
+    }).catch(e => {
+        console.log(e)
+    })
+    return false
+})
+
+$(document).on("click", "#export_all_scans", function () {
+    if ($(this).hasClass('disabled')) return false
+    const tasks = []
+    tasks.push(dastController.exportScanResult().then(result => {
+        if (result) downloadScanExport(result, "PTK_DAST_scan.json")
+    }))
+    tasks.push(iastController.exportScanResult().then(result => {
+        if (result) downloadScanExport(result, "PTK_IAST_scan.json")
+    }))
+    tasks.push(sastController.exportScanResult().then(result => {
+        if (result) downloadScanExport(result, "PTK_SAST_scan.json")
+    }))
+    tasks.push(scaController.exportScanResult().then(result => {
+        if (result) downloadScanExport(result, "PTK_SCA_scan.json")
+    }))
+    Promise.all(tasks).catch(err => {
+        console.log(err)
+    })
+    return false
+})
+
 $(document).on("click", "#manage_scans", function () {
-    controller.init().then(function (result) {
-        if (!result?.activeTab?.url) {
-            $('#result_header').text("Error")
-            $('#result_message').text("Active tab not set. Reload required tab to activate tracking.")
-            $('#result_dialog').modal('show')
-            return false
-        }
+    window._ptkReloadWarningClosed = false
+    const initOpts = controller.tabId ? { tabId: controller.tabId, url: controller.url } : {}
+    controller.init(initOpts).then(function (result) {
+        const resolvedTabPromise = controller.tabId
+            ? Promise.resolve({ tabId: controller.tabId, url: controller.url })
+            : resolveActiveTab(result)
+        return resolvedTabPromise.then(async function (activeTab) {
+            if (!activeTab?.url || typeof activeTab?.tabId === 'undefined') {
+                $('#result_header').text("Error")
+                $('#result_message').text("Active tab not set. Reload required tab to activate tracking.")
+                $('#result_dialog').modal('show')
+                return false
+            }
+            result.activeTab = activeTab
+            controller.activeTab = activeTab
 
-        let h = new URL(result.activeTab.url).host
-        $('#scan_host').text(h)
-        $('#scan_domains').text(h)
-        changeScanView(result)
+            let h = new URL(result.activeTab.url).host
+            $('#scan_host').text(h)
+            $('#scan_domains').text(h)
+            applyDashboardScanControls(result?.scans)
 
-        let settings = result.scans.dastSettings
-        $('#maxRequestsPerSecond').val(settings.maxRequestsPerSecond)
-        $('#concurrency').val(settings.concurrency)
-        $('#dast-scan-strategy').val(settings.dastScanStrategy || 'SMART')
-        setRunCveState(false)
-
-        $('#run_scan_dlg')
-            .modal({
-                allowMultiple: true,
-                onApprove: function () {
-                    let $form = $('#index_scans_form'), values = $form.form('get values')
-                    let s = {
-                        dast: values['dast_scan'] == 'on' ? true : false,
-                        iast: values['iast_scan'] == 'on' ? true : false,
-                        sast: values['sast_scan'] == 'on' ? true : false,
-                        sca: values['sca_scan'] == 'on' ? true : false,
-                    }
-                    let sast_policy = $('#policy').val()
-                    const settings = {
-                        maxRequestsPerSecond: $('#maxRequestsPerSecond').val(),
-                        concurrency: $('#concurrency').val(),
-                        sast_policy: $('#policy').val(),
-                        scanStrategy: $('#dast-scan-strategy').val() || 'SMART',
-                        runCve: isRunCveEnabled()
-                    }
-                    controller.runBackroungScan(result.activeTab.tabId, h, $('#scan_domains').val(), s, settings).then(function (result) {
-                        //changeView(result)
-                    })
-                }
+            let settings = result.scans.dastSettings
+            $('#maxRequestsPerSecond').val(settings.maxRequestsPerSecond)
+            $('#concurrency').val(settings.concurrency)
+            $('#dast-scan-strategy').val(settings.dastScanStrategy || 'SMART')
+            $('#dast-scan-policy').val(settings.dastScanPolicy || 'ACTIVE')
+            setRunCveState(false)
+            const contentReady = await rutils.pingContentScript(activeTab.tabId, { timeoutMs: 1800 })
+            console.log("[PTK] Manage scans content ping", {
+                tabId: activeTab.tabId,
+                url: activeTab.url,
+                contentReady,
+                cachedReady: controller._contentReadyByTabId?.[activeTab.tabId]
             })
-            .modal('show')
-        $('#index_scans_form .question')
-            .popup({
-                inline: true,
-                hoverable: true,
-                position: 'bottom left',
-                delay: {
-                    show: 300,
-                    hide: 800
-                }
-            })
+            setReloadWarning($('#ptk_reload_warning'), !contentReady)
+            updateRuntimeScanToggles(contentReady)
+
+            $('#run_scan_dlg')
+                .modal({
+                    allowMultiple: true,
+                    onApprove: function () {
+                        let $form = $('#index_scans_form'), values = $form.form('get values')
+                        let s = {
+                            dast: values['dast_scan'] == 'on' ? true : false,
+                            iast: values['iast_scan'] == 'on' ? true : false,
+                            sast: values['sast_scan'] == 'on' ? true : false,
+                            sca: values['sca_scan'] == 'on' ? true : false,
+                        }
+                        let sastScanStrategy = $('#sast-scan-strategy').val()
+                        const settings = {
+                            maxRequestsPerSecond: $('#maxRequestsPerSecond').val(),
+                            concurrency: $('#concurrency').val(),
+                            sastScanStrategy: sastScanStrategy || 0,
+                            scanStrategy: $('#dast-scan-strategy').val() || 'SMART',
+                            dastScanPolicy: $('#dast-scan-policy').val() || 'ACTIVE',
+                            runCve: isRunCveEnabled()
+                        }
+                        if (!contentReady && (s.iast || s.sast)) {
+                            setReloadWarning($('#ptk_reload_warning'), true)
+                            return false
+                        }
+                        controller.runBackroungScan(result.activeTab.tabId, h, $('#scan_domains').val(), s, settings).then(function (result) {
+                            //changeView(result)
+                        })
+                    }
+                })
+                .modal('show')
+            $('#index_scans_form .question')
+                .popup({
+                    inline: true,
+                    hoverable: true,
+                    delay: {
+                        show: 300,
+                        hide: 800
+                    }
+                })
+        })
     })
 
     return false
@@ -548,9 +988,15 @@ $(document).on("click", "#manage_scans", function () {
 
 /* Chrome runtime events handlers */
 browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
-
     if (message.channel == "ptk_content2popup" && message.type == "init_complete") {
         controller.storage = message.data.auth
+        if (controller.tabId) {
+            controller._contentReadyByTabId = controller._contentReadyByTabId || {}
+            controller._contentReadyByTabId[controller.tabId] = true
+            clearContentTimeout(controller.tabId)
+        }
+        bindStorage(true)
+        $('#storage_no_access').hide()
         controller.complete(message.data)
         //setTimeout(function () { controller.complete(message.data) }, 500) //TODO - remove timeout, but keep cookies 
     }
@@ -563,8 +1009,19 @@ browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
             bindCookies()
             bindHeaders()
         }
+        if (message.type == "cookies_loaded") {
+            Object.assign(controller, message.data)
+            bindCookies()
+        }
 
         if (message.type == "analyze_complete") {
+            // Clear any pending analysis timeout
+            if (window._ptkAnalysisTimeout) {
+                clearTimeout(window._ptkAnalysisTimeout)
+                window._ptkAnalysisTimeout = null
+            }
+            controller._analysisRequested = false
+
             let technologies = []
             if (Array.isArray(controller.tab?.technologies)) {
                 technologies = technologies.concat(controller.tab.technologies)
@@ -573,16 +1030,40 @@ browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
                 technologies = technologies.concat(message.data.tab.technologies)
             }
             Object.assign(controller, message.data)
+            if (!controller.storage && controller.tab?.storage) {
+                controller.storage = controller.tab.storage
+            }
             if (technologies.length > 0 && controller.tab) {
                 controller.tab.technologies = mergeTechnologyRows(technologies)
             }
 
-            bindTechnologies()
-            bindCVEs()
-            bindStorage()
-            $('#generate_report').removeClass('disabled')
-            $('#manage_scans').removeClass('disabled')
+            bindTechnologies(true)
+            bindCVEs(true)
 
+        }
+
+        if (message.type == "headers_update") {
+            const tabId = message.tabId
+            if (!tabId || tabId !== controller.tabId) return
+            if (message.requestId && controller._lastHeadersRequestId && message.requestId !== controller._lastHeadersRequestId) {
+                return
+            }
+            const sig = message.sig || ''
+            if (sig && controller._headersSig === sig) return
+            controller._headersSig = sig
+            controller.tab = controller.tab || {}
+            if (message.owasp?.findings) {
+                controller.tab.findings = message.owasp.findings
+            }
+            if (message.requestHeaders) {
+                controller.tab.requestHeaders = message.requestHeaders
+            }
+            if (message.status === "error") {
+                $('.loader.owasp').hide()
+                return
+            }
+            bindOWASP()
+            bindHeaders()
         }
     }
 })

@@ -36,6 +36,28 @@ function escapeText(value, fallback = "—") {
     return ptk_utils.escapeHtml(String(value))
 }
 
+function resolveConfidenceValue(...candidates) {
+    for (const value of candidates) {
+        if (value === undefined || value === null || value === "") continue
+        const num = Number(value)
+        if (Number.isFinite(num)) {
+            return Math.max(0, Math.min(100, num))
+        }
+    }
+    return null
+}
+
+function formatConfidence(confidence) {
+    if (!Number.isFinite(confidence)) return null
+    return Math.round(confidence)
+}
+
+function renderConfidenceLine(confidence) {
+    const value = formatConfidence(confidence)
+    if (value === null) return ""
+    return `<p><b>Confidence:</b> ${value}</p>`
+}
+
 function getSeverityMeta(severity) {
     const normalized = String(severity || "").toLowerCase()
     const defaults = REPORT_SEVERITY_STYLES[normalized] || {
@@ -184,6 +206,8 @@ function renderSastFinding(item, index) {
     const ruleNumberLabel = `Rule ${index + 1}`
     const ruleId = item.metadata?.id || item.rule_id || item.module_metadata?.id || "N/A"
     const moduleName = item.module_metadata?.name || item.module_metadata?.id || ""
+    const confidence = resolveConfidenceValue(item.confidence, item.metadata?.confidence)
+    const confidenceLine = renderConfidenceLine(confidence)
     const description = sanitizeRichText(item.metadata?.description || item.module_metadata?.description || "")
     const recommendation = sanitizeRichText(item.metadata?.recommendation || item.module_metadata?.recommendation || "")
     const references = renderReferenceLinks(item.metadata?.links || item.module_metadata?.links || {})
@@ -202,6 +226,7 @@ function renderSastFinding(item, index) {
 
                             <p><b>Rule:</b> ${escapeText(ruleId)}</span>
                             ${moduleName ? `<span><b>Module:</b> ${escapeText(moduleName)}</p>` : ""}
+                            ${confidenceLine}
 
                 </div>
 
@@ -216,8 +241,17 @@ function renderSastFinding(item, index) {
 }
 
 function getIastEvidence(item) {
-    if (!item || !Array.isArray(item.evidence)) return null
-    return item.evidence.find(e => e?.source === "IAST") || item.evidence[0] || null
+    if (!item || !item.evidence) return null
+    if (item.evidence.iast && typeof item.evidence.iast === "object") {
+        return item.evidence.iast
+    }
+    if (Array.isArray(item.evidence)) {
+        return item.evidence.find(e => e && typeof e === "object") || null
+    }
+    if (typeof item.evidence === "object") {
+        return item.evidence
+    }
+    return null
 }
 
 function normalizeIastValue(value) {
@@ -330,7 +364,8 @@ function renderIastFinding(item, index) {
     const ruleId = raw.ruleId || original?.ruleId || ""
     const moduleName = meta.moduleName || original?.moduleName || ""
     const category = original?.category || item.category || meta.type || ""
-    const url = item.location?.url || raw.location?.url || original?.location?.url || ""
+    const routingUrl = evidence?.routing?.runtimeUrl || evidence?.routing?.url || ""
+    const url = routingUrl || item.location?.url || raw.location?.url || original?.location?.url || ""
     const safeUrl = safeHttpLink(url)
     const urlDisplay = safeUrl
         ? `<a href="${ptk_utils.escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${ptk_utils.escapeHtml(safeUrl)}</a>`
@@ -344,6 +379,12 @@ function renderIastFinding(item, index) {
     const description = sanitizeRichText(original?.description || meta.description || "")
     const recommendation = sanitizeRichText(original?.recommendation || meta.recommendation || "")
     const references = renderReferenceLinks(original?.links || meta.links || {})
+    const confidence = resolveConfidenceValue(
+        item.confidence,
+        original?.confidence,
+        item.metadata?.confidence,
+        original?.metadata?.confidence
+    )
     const severityAttr = ptk_utils.escapeHtml(String(severityValue || "").toLowerCase())
     const requestKeyAttr = item.requestKey ? ` data-request-key="${ptk_utils.escapeHtml(String(item.requestKey))}"` : ""
     const ruleMetaLine = [
@@ -354,7 +395,8 @@ function renderIastFinding(item, index) {
         { label: "Source", value: escapeText(sourceLabel) },
         { label: "Sink", value: escapeText(sinkLabel) },
         { label: "Category", value: category ? escapeText(category) : "" },
-        { label: "URL", value: urlDisplay }
+        { label: "URL", value: urlDisplay },
+        { label: "Confidence", value: confidence !== null ? String(Math.round(confidence)) : "" }
     ])
     const contextSection = renderIastContextSection(context, snippetValue)
     const flowSection = renderIastFlowSection(flow)
@@ -637,12 +679,14 @@ function mapDastFindingToLegacy(finding, viewModel) {
         info: {
             metadata: {
                 name: finding?.ruleName || finding?.vulnId || finding?.category || "Finding",
-                severity: severityTitle
+                severity: severityTitle,
+                confidence: Number.isFinite(finding?.confidence) ? finding.confidence : null
             },
             proof,
             request,
             response,
-            success: true
+            success: true,
+            confidence: Number.isFinite(finding?.confidence) ? finding.confidence : null
         },
         original: {
             request,
@@ -656,6 +700,10 @@ function mapSastFindingToLegacy(finding) {
     const severityTitle = severity.charAt(0).toUpperCase() + severity.slice(1)
     const evidence = finding?.evidence?.sast || {}
     const defaultSnippet = evidence.codeSnippet || ""
+    const owaspLegacy = finding?.owaspLegacy || ""
+    const cweText = Array.isArray(finding?.cwe)
+        ? finding.cwe.join(", ")
+        : (finding?.cwe || "")
     const source = evidence.source || {
         sourceName: finding?.source || finding?.ruleName || "Source",
         sourceFile: finding?.location?.file || "",
@@ -677,15 +725,16 @@ function mapSastFindingToLegacy(finding) {
             severity: severityTitle,
             description: finding?.description || "",
             recommendation: finding?.recommendation || "",
-            links: finding?.links || {}
+            links: finding?.links || {},
+            confidence: Number.isFinite(finding?.confidence) ? finding.confidence : null
         },
         module_metadata: {
             id: finding?.moduleId || "",
             name: finding?.moduleName || "",
             severity: severityTitle,
             category: finding?.category || "",
-            owasp: finding?.owasp || "",
-            cwe: finding?.cwe || "",
+            owasp: owaspLegacy,
+            cwe: cweText,
             description: "",
             recommendation: "",
             links: {}
@@ -735,6 +784,7 @@ function mapIastFindingToLegacy(finding, index) {
             context,
             trace: context.flow
         }],
+        confidence: Number.isFinite(finding?.confidence) ? finding.confidence : null,
         success: true,
         __finding: finding
     }
@@ -786,18 +836,21 @@ jQuery(function () {
     }
 
     async function bindOWASP() {
-        let raw = index_controller.tab.findings ? index_controller.tab.findings : new Array()
+        const tab = index_controller.tab || {}
+        let raw = tab.findings ? tab.findings : new Array()
         let dt = raw.map(item => [item[0]])
         let params = { "data": dt, "columns": [{ width: "100%" }] }
         let table = bindTable('#tbl_owasp', params)
         table.columns.adjust().draw()
         $('.loader.owasp').hide()
+        updateReportDashboardVisibility()
     }
 
     async function bindCVEs() {
         let dt = new Array()
-        if (Array.isArray(index_controller.tab.cves)) {
-            index_controller.tab.cves.forEach(item => {
+        const tab = index_controller.tab || {}
+        if (Array.isArray(tab.cves)) {
+            tab.cves.forEach(item => {
                 const evidence = item.evidence || {}
                 const evidenceText = `H:${evidence.headers || 0} / HTML:${evidence.html || 0} / JS:${evidence.js || 0}`
                 const verifyText = item.verify?.moduleId ? `DAST module: ${item.verify.moduleId}` : ''
@@ -812,12 +865,14 @@ jQuery(function () {
         let params = { "data": dt }
         bindTable('#tbl_cves', params)
         $('.loader.cves').hide()
+        updateReportDashboardVisibility()
     }
 
     async function bindTechnologies() {
         let dt = new Array()
-        if (index_controller.tab.technologies)
-            Object.values(index_controller.tab.technologies).forEach(item => {
+        const tab = index_controller.tab || {}
+        if (tab.technologies)
+            Object.values(tab.technologies).forEach(item => {
                 dt.push([item.name, item.version, item.category || ''])
             })
         const priority = (category) => {
@@ -840,17 +895,19 @@ jQuery(function () {
         let params = { "data": dt, "columns": [{ width: "45%" }, { width: "30%" }, { width: "25%" }] }
         bindTable('#tbl_technologies', params)
         $('.loader.technologies').hide()
+        updateReportDashboardVisibility()
     }
 
 
     function bindCookies() {
-        if (Object.keys(index_controller.tab.cookies).length) {
+        const tab = index_controller.tab || {}
+        if (tab.cookies && Object.keys(tab.cookies).length) {
             $("a[data-tab='cookie']").show()
             $('#tbl_storage').DataTable().row.add(['Cookie', `<a href="#" class="storage_auth_link" data="cookie">View</a>`]).draw()
 
 
             let dt = new Array()
-            Object.values(index_controller.tab.cookies).forEach(item => {
+            Object.values(tab.cookies).forEach(item => {
                 //Object.values(domain).forEach(item => {
                 dt.push([item.domain, item.name, item.value, item.httpOnly])
                 //})
@@ -892,6 +949,7 @@ jQuery(function () {
         }
         $('.loader.storage').hide()
         bindTokens()
+        updateReportDashboardVisibility()
     }
 
     async function bindTokens(data) {
@@ -908,8 +966,10 @@ jQuery(function () {
 
     function bindStorage() {
         let dt = new Array()
-        Object.keys(index_controller.tab.storage).forEach(key => {
-            let item = JSON.parse(index_controller.tab.storage[key])
+        const tab = index_controller.tab || {}
+        const storage = tab.storage || {}
+        Object.keys(storage).forEach(key => {
+            let item = JSON.parse(storage[key])
             if (Object.keys(item).length > 0 && item[key] != "") {
                 $(document).trigger("bind_" + key, item)
                 $("a[data-tab='" + key + "']").show()
@@ -923,14 +983,16 @@ jQuery(function () {
         $('.loader.storage').hide()
 
         bindTokens()
+        updateReportDashboardVisibility()
     }
 
     function bindHeaders() {
-        if (Object.keys(index_controller.tab.requestHeaders).length) {
+        const tab = index_controller.tab || {}
+        if (tab.requestHeaders && Object.keys(tab.requestHeaders).length) {
             let dt = new Array()
-            Object.keys(index_controller.tab.requestHeaders).forEach(name => {
+            Object.keys(tab.requestHeaders).forEach(name => {
                 if (name.startsWith('x-') || name == 'authorization' || name == 'cookie') {
-                    dt.push([name, index_controller.tab.requestHeaders[name][0]])
+                    dt.push([name, tab.requestHeaders[name][0]])
                 }
             })
             let params = {
@@ -947,6 +1009,27 @@ jQuery(function () {
                 } catch (e) { }
             }
             bindTokens()
+            updateReportDashboardVisibility()
+        }
+    }
+
+    function reportHasCardData() {
+        const tab = index_controller.tab || {}
+        const hasTech = Array.isArray(tab.technologies) && tab.technologies.length > 0
+        const hasWaf = Array.isArray(tab.waf) ? tab.waf.length > 0 : !!tab.waf
+        const hasCves = Array.isArray(tab.cves) && tab.cves.length > 0
+        const hasOwasp = Array.isArray(tab.findings) && tab.findings.length > 0
+        const hasHeaders = tab.requestHeaders && Object.keys(tab.requestHeaders).length > 0
+        const hasStorage = tab.storage && Object.keys(tab.storage).length > 0
+        const hasCookies = tab.cookies && Object.keys(tab.cookies).length > 0
+        return hasTech || hasWaf || hasCves || hasOwasp || hasHeaders || hasStorage || hasCookies
+    }
+
+    function updateReportDashboardVisibility() {
+        if (reportHasCardData()) {
+            $('#dashboard').show()
+        } else {
+            $('#dashboard').hide()
         }
     }
 
@@ -1004,8 +1087,8 @@ jQuery(function () {
         $container.html("")
 
         const sortBySeverity = (a, b) => {
-            const left = a?.severity || a?.metadata?.severity || a?.evidence?.[0]?.raw?.severity
-            const right = b?.severity || b?.metadata?.severity || b?.evidence?.[0]?.raw?.severity
+            const left = a?.severity || a?.metadata?.severity || "info"
+            const right = b?.severity || b?.metadata?.severity || "info"
             return severityRank(left) - severityRank(right)
         }
 
@@ -1229,7 +1312,7 @@ jQuery(function () {
         }
 
         $('#rattacker_report #attacks_count').text(stats.attacksCount ?? findings.length ?? 0)
-        $('#rattacker_report #vulns_count').text(stats.vulnsCount ?? findings.length ?? 0)
+        $('#rattacker_report #vulns_count').text(stats.findingsCount ?? findings.length ?? 0)
         $('#rattacker_report #critical_count').text(stats.critical ?? scanResult.stats?.critical ?? 0)
         $('#rattacker_report #high_count').text(stats.high ?? scanResult.stats?.high ?? 0)
         $('#rattacker_report #medium_count').text(stats.medium ?? scanResult.stats?.medium ?? 0)
@@ -1262,6 +1345,8 @@ jQuery(function () {
         let misc = rutils.getMisc(info)
         let icon = misc.icon, order = misc.order, attackClass = misc.attackClass
         const severityMeta = getSeverityMeta(info.metadata?.severity || info.severity)
+        const confidence = resolveConfidenceValue(info.confidence, info.metadata?.confidence)
+        const confidenceLine = renderConfidenceLine(confidence)
 
         if (info.proof)
             proof = `<div class="description"><p>Proof: <b><i name="proof">${ptk_utils.escapeHtml((info.proof))}</i></b></p></div>`
@@ -1282,6 +1367,7 @@ jQuery(function () {
                                     <a href="${target}" target="_blank">${target}</a>
                                 </div>
                                 <p>Attack: ${ptk_utils.escapeHtml(info.metadata.name)} </p>
+                                ${confidenceLine}
                                 ${proof}
                             </div>
                         </div>
@@ -1321,28 +1407,28 @@ jQuery(function () {
     }
 
     if (params.has('rattacker_report')) {
-        $('#main').hide()
+        $('#dashboard').hide()
         $('#rattacker_report').show()
         rattacker_controller.init().then(function (result) {
             bindInfo(result?.scanResult?.host)
             generateRattacker(result)
         })
     } else if (params.has('iast_report')) {
-        $('#main').hide()
+        $('#dashboard').hide()
         $('#iast_report').show()
         iast_controller.init().then(function (result) {
             bindInfo(result?.scanResult?.host)
             generateIAST(result)
         })
     } else if (params.has('sast_report')) {
-        $('#main').hide()
+        $('#dashboard').hide()
         $('#sast_report').show()
         sast_controller.init().then(function (result) {
             bindInfo(result?.scanResult?.host)
             generateSAST(result)
         })
     } else if (params.has('sca_report')) {
-        $('#main').hide()
+        $('#dashboard').hide()
         $('#sca_report').show()
         sca_controller.init().then(function (result) {
             bindInfo(result?.scanResult?.host)
@@ -1350,47 +1436,75 @@ jQuery(function () {
         })
     } else if (params.has('full_report')) {
         index_controller.get().then(() => {
-            let host = new URL(index_controller.url).host
-            $('#main').show()
-            bindInfo(host)
-            bindOWASP()
+            index_controller.tab = index_controller.tab || {}
+            let host = null
+            $('#dashboard').show()
             browser.storage.local.get('tab_full_info').then(function (result) {
                 const info = result?.tab_full_info || {}
-                if (info.technologies) {
-                    index_controller.tab.technologies = info.technologies
+                if (Object.prototype.hasOwnProperty.call(info, 'tabId')) {
+                    index_controller.tab.tabId = info.tabId
                 }
-                if (info.waf) {
-                    index_controller.tab.waf = info.waf
+                if (Object.prototype.hasOwnProperty.call(info, 'url')) {
+                    index_controller.url = info.url
                 }
-                index_controller.tab.cves = info.cves || index_controller.tab.cves || []
+                if (Object.prototype.hasOwnProperty.call(info, 'technologies')) {
+                    index_controller.tab.technologies = info.technologies || []
+                }
+                if (Object.prototype.hasOwnProperty.call(info, 'waf')) {
+                    index_controller.tab.waf = info.waf || null
+                }
+                if (Object.prototype.hasOwnProperty.call(info, 'cves')) {
+                    index_controller.tab.cves = info.cves || []
+                }
+                if (Object.prototype.hasOwnProperty.call(info, 'findings')) {
+                    index_controller.tab.findings = info.findings || []
+                }
+                if (Object.prototype.hasOwnProperty.call(info, 'requestHeaders')) {
+                    index_controller.tab.requestHeaders = info.requestHeaders || {}
+                }
+                if (Object.prototype.hasOwnProperty.call(info, 'storage')) {
+                    index_controller.tab.storage = info.storage || {}
+                }
+                if (Object.prototype.hasOwnProperty.call(info, 'cookies')) {
+                    index_controller.tab.cookies = info.cookies || {}
+                }
 
+                let host = null
+                try {
+                    host = index_controller.url ? new URL(index_controller.url).host : null
+                } catch (_) {
+                    host = null
+                }
+                bindInfo(host)
+                bindOWASP()
                 bindTechnologies()
                 bindCVEs()
                 bindCookies()
+                bindStorage()
+                bindHeaders()
 
                 if (result?.tab_full_info) {
                     browser.storage.local.remove('tab_full_info')
                 }
-            })
-            bindStorage()
-            bindHeaders()
-            rattacker_controller.init().then(function (result) {
-                if (hostsMatch(host, result?.scanResult?.host))
-                    generateRattacker(result)
-            })
-            iast_controller.init().then(function (result) {
-                if (hostsMatch(host, result?.scanResult?.host))
-                    generateIAST(result)
-            })
 
-            sast_controller.init().then(function (result) {
-                if (hostsMatch(host, result?.scanResult?.host))
-                    generateSAST(result)
-            })
+                rattacker_controller.init().then(function (result) {
+                    if (hostsMatch(host, result?.scanResult?.host))
+                        generateRattacker(result)
+                })
+                iast_controller.init().then(function (result) {
+                    if (hostsMatch(host, result?.scanResult?.host))
+                        generateIAST(result)
+                })
 
-            sca_controller.init().then(function (result) {
-                if (hostsMatch(host, result?.scanResult?.host))
-                    generateSCA(result)
+                sast_controller.init().then(function (result) {
+                    if (hostsMatch(host, result?.scanResult?.host))
+                        generateSAST(result)
+                })
+
+                sca_controller.init().then(function (result) {
+                    if (hostsMatch(host, result?.scanResult?.host))
+                        generateSCA(result)
+                })
             })
         })
     }

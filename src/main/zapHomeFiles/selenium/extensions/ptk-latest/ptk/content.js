@@ -5,6 +5,28 @@ const isChrome = !!window.chrome && !!window.chrome.runtime;
 //console.log({ isChrome, isFirefox });
 
 const INJECT_SCRIPT_ID = 'ptk-inject-bridge';
+const runtime = (typeof browser !== 'undefined' && browser?.runtime)
+    ? browser.runtime
+    : (typeof chrome !== 'undefined' && chrome?.runtime ? chrome.runtime : null);
+
+
+function runtimeGetURL(path) {
+    if (!runtime?.getURL) return null;
+    try {
+        return runtime.getURL(path);
+    } catch (_) {
+        return null;
+    }
+}
+
+function sendRuntimeMessage(payload) {
+    if (!runtime?.sendMessage) return Promise.resolve();
+    try {
+        return runtime.sendMessage(payload);
+    } catch (_) {
+        return Promise.resolve();
+    }
+}
 const pendingWappalyzerRequests = new Map();
 let injectBridgeReady = false;
 let injectBridgePromise = null;
@@ -56,7 +78,12 @@ function ensureInjectBridge() {
             onLoad();
         };
         script.onerror = onError;
-        script.src = browser.runtime.getURL('ptk/inject.js');
+        const injectUrl = runtimeGetURL('ptk/inject.js');
+        if (!injectUrl) {
+            reject(new Error('Runtime unavailable for inject script'));
+            return;
+        }
+        script.src = injectUrl;
         (document.documentElement || document.head || document.body).appendChild(script);
     });
 
@@ -65,7 +92,7 @@ function ensureInjectBridge() {
 
 // keep service worker alive
 setInterval(function () {
-    browser.runtime.sendMessage({
+    sendRuntimeMessage({
         channel: "ptk_popup2background_app",
         type: "ping"
     }).catch(e => e)
@@ -86,12 +113,19 @@ setInterval(function () {
         // try {
         //     console.log('[PTK][SPA][content] hash/history change detected', href)
         // } catch (_) { }
-        browser.runtime.sendMessage({
+        sendRuntimeMessage({
             channel: "ptk_content2rattacker",
             type: "spa_url_changed",
             url: href
         }).catch(e => {
             //try { console.warn('[PTK][SPA][content] failed to send spa_url_changed', e) } catch (_) { }
+        })
+        sendRuntimeMessage({
+            channel: "ptk_content_sast2background_sast",
+            type: "spa_url_changed",
+            url: href
+        }).catch(e => {
+            // try { console.warn('[PTK][SPA][content] failed to send spa_url_changed to SAST', e) } catch (_) { }
         })
     }
 
@@ -116,32 +150,66 @@ setInterval(function () {
 })();
 
 
-(() => {
-    window.addEventListener('load', () => {
-        const scripts = Array.from(document.scripts)
-            .map(s => ({
-                src: s.src || null,
-                code: s.src ? null : s.innerText
-            }))
-            .filter(script => {
-                if (!script.src) return true;
-                return /^https?:\/\//i.test(script.src);
-            });
-        browser.runtime.sendMessage({
-            channel: "ptk_content_sast2background_sast",
-            type: "scripts_collected",
-            scripts: scripts,
-            html: document.documentElement.innerHTML,
-            file: document.URL
+function collectSastPayload() {
+    const scripts = Array.from(document.scripts)
+        .map(s => ({
+            src: s.src || null,
+            code: s.src ? null : s.innerText
+        }))
+        .filter(script => {
+            if (!script.src) return true;
+            return /^https?:\/\//i.test(script.src);
         });
+    return {
+        scripts: scripts,
+        html: document.documentElement.innerHTML,
+        file: document.URL
+    };
+}
 
-    });
-
-
+(() => {
+    // SAST payload collection is triggered explicitly by background requests.
 })();
 
 
-browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+if (runtime?.onMessage) runtime.onMessage.addListener(function (message, sender, sendResponse) {
+    if (message && message.channel == "ptk_popup2content" && message.type == "ping") {
+        return Promise.resolve({ ok: true, url: document.URL });
+    }
+
+    if (message.channel == "ptk_background2content_sast") {
+        if (message.type == "collect_scripts") {
+            const payload = collectSastPayload();
+            sendRuntimeMessage({
+                channel: "ptk_content_sast2background_sast",
+                type: "scripts_collected",
+                requestId: message.requestId || null,
+                ...payload
+            }).catch(e => e)
+            return Promise.resolve({ ok: true })
+        }
+        if (message.type == "sast_set_hash") {
+            const targetHash = typeof message.hash === "string" ? message.hash : "";
+            if (window.location.hash !== targetHash) {
+                window.location.hash = targetHash;
+            }
+            return Promise.resolve({ ok: true, url: document.URL });
+        }
+        if (message.type == "sast_wait_ready") {
+            const delayMs = Number(message.delayMs || 300);
+            const waitReady = () => new Promise((resolve) => {
+                if (document.readyState === "complete") return resolve();
+                const onReady = () => {
+                    window.removeEventListener("load", onReady);
+                    resolve();
+                };
+                window.addEventListener("load", onReady);
+            });
+            return waitReady().then(() => new Promise((resolve) => setTimeout(resolve, delayMs)))
+                .then(() => ({ ok: true, url: document.URL }));
+        }
+    }
+
     if (message.channel == "ptk_background2content" && message.type == "init") {
         const requestId = message.requestId || `ptk-wappalyzer-${Date.now()}-${Math.random().toString(36).slice(2)}`
         const payload = {
@@ -181,6 +249,16 @@ browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
             window.postMessage({
                 channel: 'ptk_background_iast2content_modules',
                 iastModules: message.iastModules
+            }, '*')
+        } catch (_) { }
+        return Promise.resolve({ ok: true })
+    }
+
+    if (message.channel == "ptk_background_iast2content_token_origin") {
+        try {
+            window.postMessage({
+                channel: 'ptk_background_iast2content_token_origin',
+                tokens: Array.isArray(message.tokens) ? message.tokens : []
             }, '*')
         } catch (_) { }
         return Promise.resolve({ ok: true })
@@ -271,12 +349,13 @@ window.addEventListener("message", (event) => {
             try {
                 window.postMessage({
                     channel: 'ptk_background_iast2content_modules',
-                    iastModules: resp?.iastModules || null
+                    iastModules: resp?.iastModules || null,
+                    scanStrategy: resp?.scanStrategy || null
                 }, '*')
             } catch (_) { }
         }).catch(err => {
             try {
-                console.warn('[PTK IAST DEBUG] content failed to fetch modules', err)
+                console.warn('[PTK IAST] content failed to fetch modules', err)
             } catch (_) { }
             try {
                 window.postMessage({
@@ -345,7 +424,7 @@ function handleAutomationBridgeMessage(data) {
         }
     }).catch((error) => {
         try {
-            console.warn('[PTK][automation] Failed to forward automation message', error)
+        // Swallow automation forwarding errors to avoid console noise in content context.
         } catch (_) { }
     })
 }
