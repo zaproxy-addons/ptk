@@ -71,6 +71,25 @@ function extractPath(node) {
   return "";
 }
 
+function normalizePathLabel(label) {
+  if (!label || typeof label !== "string") return null;
+  const trimmed = label.trim();
+  if (!trimmed) return null;
+  if (/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(trimmed)) return trimmed;
+  return null;
+}
+
+function extractAngularQueryParamPath(label) {
+  if (!label || typeof label !== "string") return null;
+  const direct = label.match(/queryParams\.([A-Za-z_$][\w$]*)/);
+  if (direct) return `queryParams.${direct[1]}`;
+  const bracket = label.match(/queryParams\\[['"]([^'"]+)['"]\\]/);
+  if (bracket) return `queryParams.${bracket[1]}`;
+  const getter = label.match(/queryParams\\.get\\(['"]([^'"]+)['"]\\)/);
+  if (getter) return `queryParams.${getter[1]}`;
+  return null;
+}
+
 function _nodeType(node) {
   return node?.type || "Node";
 }
@@ -140,9 +159,39 @@ function resolveCodeForFile(codeByFile, key, fallbackFile) {
   return first ? codeByFile[first] : "";
 }
 
+function literalStringValue(node) {
+  if (!node) return null;
+  if (node.type === "Literal" && typeof node.value === "string") return node.value;
+  if (node.type === "TemplateLiteral" && (node.expressions || []).length === 0) {
+    return (node.quasis || []).map((q) => q?.value?.cooked || "").join("");
+  }
+  return null;
+}
+
+function memberPropName(node) {
+  if (!node || node.type !== "MemberExpression") return null;
+  if (node.computed) {
+    if (node.property?.type === "Literal") return String(node.property.value);
+    if (node.property?.type === "Identifier") return node.property.name;
+    return null;
+  }
+  if (node.property?.type === "Identifier") return node.property.name;
+  if (node.property?.type === "Literal") return String(node.property.value);
+  return null;
+}
+
 function _pickSinkLabel({ sinkNode, code }) {
   if (!sinkNode) return "";
   if (sinkNode.type === "CallExpression") {
+    const innerHtmlArg = literalStringValue(sinkNode.arguments?.[0]);
+    const setPropArg = literalStringValue(sinkNode.arguments?.[1]);
+    const calleeName = extractPath(sinkNode.callee) || "";
+    if (/ɵɵproperty$/.test(calleeName) && /^(innerHTML|outerHTML)$/.test(innerHtmlArg || "")) {
+      return `${calleeName}('${innerHtmlArg}', ...)`;
+    }
+    if (/setProperty$/.test(calleeName) && /^(innerHTML|outerHTML)$/.test(setPropArg || "")) {
+      return `${calleeName}('${setPropArg}', ...)`;
+    }
     const cal = sinkNode.callee;
     const label = extractPath(cal);
     return label || exprToShortLabel(cal, { code });
@@ -154,9 +203,81 @@ function _pickSinkLabel({ sinkNode, code }) {
 }
 
 function _pickSourceLabel({ sourceNode, sinkNode, code }) {
+  if (sourceNode?._ptkOriginLabel) return sourceNode._ptkOriginLabel;
   if (sourceNode) return exprToShortLabel(sourceNode, { code });
   if (sinkNode?.type === "AssignmentExpression") return exprToShortLabel(sinkNode.right, { code });
   return exprToShortLabel(sinkNode, { code });
+}
+
+function urlSearchParamsHintFromTrace(trace) {
+  if (!Array.isArray(trace)) return null;
+  for (const step of trace) {
+    const node = step?.node;
+    if (!node || node.type !== "CallExpression") continue;
+    const callee = node.callee;
+    if (!callee || callee.type !== "MemberExpression") continue;
+    const prop = memberPropName(callee);
+    if (!prop || prop.toLowerCase() !== "get") continue;
+    const obj = callee.object;
+    if (obj?._ptkIsURLSearchParams && obj._ptkUrlSourceHint) {
+      return obj._ptkUrlSourceHint;
+    }
+  }
+  return null;
+}
+
+function paramNameFromTrace(trace) {
+  if (!Array.isArray(trace)) return null;
+  for (const step of trace) {
+    const node = step?.node;
+    if (!node || node.type !== "CallExpression") continue;
+    const callee = node.callee;
+    if (!callee || callee.type !== "MemberExpression") continue;
+    const prop = memberPropName(callee);
+    if (!prop || prop.toLowerCase() !== "get") continue;
+    const arg = node.arguments?.[0];
+    const name = literalStringValue(arg);
+    if (name) return name;
+  }
+  return null;
+}
+
+function clampConfidence(value) {
+  if (!Number.isFinite(value)) return null;
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
+function resolveSastConfidence({ mode, ruleMeta = {}, moduleMeta = {}, trace = [] }) {
+  const signals = [];
+  const ruleOverride = ruleMeta.confidence ?? ruleMeta.confidenceDefault;
+  const moduleOverride = moduleMeta.confidenceDefault;
+  if (Number.isFinite(ruleOverride)) {
+    const value = clampConfidence(ruleOverride);
+    return { confidence: value, signals: [`override:rule:${value}`] };
+  }
+  if (Number.isFinite(moduleOverride)) {
+    const value = clampConfidence(moduleOverride);
+    return { confidence: value, signals: [`override:module:${value}`] };
+  }
+
+  let confidence = mode === "taint" ? 80 : 60;
+  signals.push(`base:${mode}:${confidence}`);
+
+  const traceLen = Array.isArray(trace) ? trace.length : 0;
+  if (mode === "taint") {
+    if (traceLen === 0) {
+      confidence -= 10;
+      signals.push("trace:none:-10");
+    } else if (traceLen <= 3) {
+      confidence += 10;
+      signals.push(`trace_len:${traceLen}:+10`);
+    } else if (traceLen >= 8) {
+      confidence -= 10;
+      signals.push(`trace_len:${traceLen}:-10`);
+    }
+  }
+
+  return { confidence: clampConfidence(confidence), signals };
 }
 
 /* ───────────────────────────────────── Pattern findings ───────────────────────────────────── */
@@ -186,6 +307,16 @@ export function reportPatternFinding({ rule, context, matchNode, valueNode, extr
 
   const sourceInfo = { codeFile: sourceFileKey, snippet: sourceSnippet };
   const sinkInfo = { codeFile: sinkFileKey, snippet: sinkSnippet };
+  const sourcePath = extractPath(valueNode || matchNode) || normalizePathLabel(sourceInfo.snippet);
+
+  const ruleMeta = rule?.metadata || {};
+  const moduleMeta = extras.module_metadata || {};
+  const { confidence, signals } = resolveSastConfidence({
+    mode: "pattern",
+    ruleMeta,
+    moduleMeta,
+    trace: []
+  });
 
   const out = {
     async: false,
@@ -207,7 +338,7 @@ export function reportPatternFinding({ rule, context, matchNode, valueNode, extr
     },
     source: {
       label: exprToShortLabel(valueNode || matchNode, { code: sourceCode }),
-      path: null,
+      path: sourcePath || null,
       sourceFile: sourceFileKey,
       sourceFileFull: sourceFileKey,
       sourceLoc,
@@ -215,7 +346,10 @@ export function reportPatternFinding({ rule, context, matchNode, valueNode, extr
       sourceSnippet: sourceInfo.snippet,
     },
     success: true,
+    mode: "pattern",
     type: _nodeType(matchNode),
+    confidence,
+    evidence: { sast: { confidenceSignals: signals } }
   };
 
   if (valueNode) out.valueExpr = exprToShortLabel(valueNode, { code: sourceCode });
@@ -240,6 +374,26 @@ function traceFromPathKeys(pathKeys, graph) {
   return steps;
 }
 
+function traceToSummaries(trace, codeByFile, fallbackFile) {
+  if (!Array.isArray(trace) || !trace.length) return [];
+  const summaries = [];
+  for (const step of trace) {
+    if (!step) continue;
+    const node = step.node || null;
+    const fileKey = _nodeFileDisplay(node) || fallbackFile || null;
+    const code = fileKey ? resolveCodeForFile(codeByFile, fileKey, fallbackFile) : "";
+    const label = node ? exprToShortLabel(node, { code }) : (step.label || "");
+    const entry = {
+      kind: step.kind || null,
+      label: label || null,
+      file: fileKey,
+      loc: node?.loc || null
+    };
+    if (entry.kind || entry.label || entry.file || entry.loc) summaries.push(entry);
+  }
+  return summaries;
+}
+
 export function reportTaintFinding({ rule, context, sourceNode, sinkNode, taintTrace, extras = {} }) {
   const graph = extras.graph || null;
   if ((!taintTrace || !taintTrace.length) && Array.isArray(extras.pathKeys) && graph) {
@@ -253,13 +407,27 @@ export function reportTaintFinding({ rule, context, sourceNode, sinkNode, taintT
 
   const sinkCode = resolveCodeForFile(codeByFile, sinkKey, context?.codeFile);
   const sourceCode = resolveCodeForFile(codeByFile, sourceKey, context?.codeFile);
+  const traceSummary = traceToSummaries(taintTrace, codeByFile, context?.codeFile);
 
   const isCall = sinkNode?.type === "CallExpression";
   const target = isCall ? sinkNode.callee : (sinkNode?.left || sinkNode);
   const sinkPath = extractPath(target);
+  const sourcePath = extractPath(sourceNode || sinkNode);
 
   const sinkLabel = _pickSinkLabel({ sinkNode, code: sinkCode });
-  const sourceLabel = _pickSourceLabel({ sourceNode, sinkNode, code: sourceCode });
+  let sourceLabel = _pickSourceLabel({ sourceNode, sinkNode, code: sourceCode });
+  const ruleId = rule?.metadata?.id || "";
+  const urlHint = urlSearchParamsHintFromTrace(taintTrace);
+  const paramName = paramNameFromTrace(taintTrace);
+  const isLocationLabel = /(^|\.)location\.(hash|search|href)$/.test(sourceLabel || "");
+  const isDocumentUrlLabel = /(^|\.)document\.URL$/.test(sourceLabel || "");
+  if (
+    urlHint &&
+    (ruleId === "dom-xss-taint" || ruleId === "dom-xss-taint-angular") &&
+    (isLocationLabel || isDocumentUrlLabel)
+  ) {
+    sourceLabel = `URLSearchParams.get from ${urlHint}`;
+  }
 
   const sourceLoc = (sourceNode || sinkNode)?.loc;
   const sinkLoc = (sinkNode?.type === "AssignmentExpression" ? sinkNode.left : sinkNode)?.loc;
@@ -275,12 +443,31 @@ export function reportTaintFinding({ rule, context, sourceNode, sinkNode, taintT
 
   const sourceInfo = { codeFile: sourceKey, snippet: sourceSnippet };
   const sinkInfo = { codeFile: sinkKey, snippet: sinkSnippet };
+  const sinkMeta = extras.sinkMeta || {};
+  let sourcePathCandidate = sourcePath || normalizePathLabel(sourceLabel);
+  if (!sourcePathCandidate) {
+    const angularPath = extractAngularQueryParamPath(sourceLabel);
+    if (angularPath) sourcePathCandidate = angularPath;
+  }
+  if (paramName && urlHint && (!sourcePathCandidate || !/searchparams|queryparams/i.test(sourcePathCandidate))) {
+    sourcePathCandidate = `searchParams.${paramName}`;
+  }
+
+  const ruleMeta = rule?.metadata || {};
+  const moduleMeta = extras.module_metadata || {};
+  const { confidence, signals } = resolveSastConfidence({
+    mode: "taint",
+    ruleMeta,
+    moduleMeta,
+    trace: taintTrace || []
+  });
 
   return {
     async: false,
     codeFile: sinkKey,
     codeSnippet: `Source context:\n${sourceInfo.snippet}\n\nSink context:\n${sinkInfo.snippet}`,
     file: "",
+    location: paramName ? { param: paramName } : undefined,
     metadata: rule.metadata,
     module_metadata: extras.module_metadata || {},
     nodeType: _nodeType(sinkNode),
@@ -288,6 +475,9 @@ export function reportTaintFinding({ rule, context, sourceNode, sinkNode, taintT
       kind: isCall ? "call" : (sinkNode?.type === "AssignmentExpression" ? "assign" : "node"),
       label: sinkLabel,
       path: sinkPath ? sinkPath.split(".") : [],
+      framework: sinkMeta.framework || null,
+      api: sinkMeta.api || null,
+      argIndex: typeof sinkMeta.argIndex === "number" ? sinkMeta.argIndex : null,
       sinkFile: sinkKey,
       sinkFileFull: sinkKey,
       sinkLoc,
@@ -296,7 +486,7 @@ export function reportTaintFinding({ rule, context, sourceNode, sinkNode, taintT
     },
     source: {
       label: sourceLabel,
-      path: null,
+      path: sourcePathCandidate || null,
       sourceFile: sourceKey,
       sourceFileFull: sourceKey,
       sourceLoc,
@@ -304,8 +494,10 @@ export function reportTaintFinding({ rule, context, sourceNode, sinkNode, taintT
       sourceSnippet: sourceInfo.snippet,
     },
     success: true,
+    mode: "taint",
     type: _nodeType(sinkNode),
-    trace: Array.isArray(taintTrace) ? taintTrace : [],
+    trace: traceSummary,
+    confidence,
+    evidence: { sast: { confidenceSignals: signals } }
   };
 }
-

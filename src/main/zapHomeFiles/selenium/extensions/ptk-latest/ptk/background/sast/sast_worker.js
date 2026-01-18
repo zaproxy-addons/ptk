@@ -13,8 +13,8 @@ self.onmessage = async (event) => {
 
   if (type === "start_scan") {
     try {
-      const { policy, opts } = msg;
-      const engine = new sastEngine(policy, { ...(opts || {}), scanId });
+      const scanStrategy = msg.scanStrategy ?? msg.policy ?? 0;
+      const engine = new sastEngine(scanStrategy, { ...((msg.opts || {})), scanId });
       engines.set(scanId, engine);
 
       const forward = (name, payload) => {
@@ -28,6 +28,7 @@ self.onmessage = async (event) => {
         "file:end",
         "module:start",
         "module:end",
+        "findings:partial",
         "scan:summary",
         "scan:error"
       ];

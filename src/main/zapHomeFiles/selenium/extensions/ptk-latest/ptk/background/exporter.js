@@ -48,7 +48,7 @@ export class ptk_exporter {
     renderXmlEvent(item, step) {
         let eventTypeName = this.getXmlEventName(item.eventTypeName),
             data = this.getXmlEventData(item),
-            path = this.getXPath(item),
+            path = this.getElementPath(item),
             duration = item.eventDuration > this.settings.min_duration ? item.eventDuration : this.settings.min_duration,
             windowIndex = item.windowIndex
 
@@ -84,6 +84,12 @@ export class ptk_exporter {
                 if (this.settings.event_type == "javascript") r = "Javascript"
                 if (this.settings.event_type == "onclick") r = "SetControlData"
                 break
+            case 'SetWindowSize':
+                r = "SetWindowSize"
+                break
+            case 'SelectWindow':
+                r = "SelectWindow"
+                break
         }
         return r
     }
@@ -110,22 +116,62 @@ export class ptk_exporter {
         return r
     }
 
-    getXmlIframePath(item) {
-        if (!item.frameInfo || Object.keys(item.frameInfo) < 1) return ""
+    getFrameLocator(frameInfo) {
+        if (!frameInfo) return ""
+        if (frameInfo?.id) return `//IFRAME[@id="${frameInfo.id}"]`
+        if (frameInfo?.name) return `//IFRAME[@name="${frameInfo.name}"]`
+        if (frameInfo?.title) return `//IFRAME[@title="${frameInfo.title}"]`
+        if (frameInfo?.src) return `//IFRAME[@src="${frameInfo.src}"]`
+        return ""
+    }
 
-        if (item.frameInfo?.id) return `//IFRAME[@id="${item.frameInfo.id}"]|||>xpath=`
-        if (item.frameInfo?.name) return `//IFRAME[@name="${item.frameInfo.name}"]|||>xpath=`
-        if (item.frameInfo?.title) return `//IFRAME[@title="${item.frameInfo.title}"]|||>xpath=`
-        if (item.frameInfo?.src) return `//IFRAME[@src="${item.frameInfo.src}"]|||>xpath=`
+    getXmlIframePath(item) {
+        const stack = Array.isArray(item?.frameStack) && item.frameStack.length
+            ? item.frameStack
+            : (item.frameInfo ? [item.frameInfo] : [])
+
+        if (!stack.length) return ""
+
+        const parts = stack
+            .map(info => this.getFrameLocator(info))
+            .filter(Boolean)
+            .map(locator => `xpath=${locator}`)
+
+        return parts.join('|||>')
     }
 
     getXPath(item) {
-        let path = this.getXmlIframePath(item)
-        if (this.settings.element_path == 'id' && item.xpath) path += item.xpath
-        if (this.settings.element_path == 'fullpath' && item.fullxpath) path += item.fullxpath
-        if (path) path = 'xpath=' + path
+        if (this.settings.event_type == "javascript") return ''
 
-        if (this.settings.event_type == "javascript") path = ''
+        const frameChain = this.getXmlIframePath(item)
+        let elementPath = ''
+        if (this.settings.element_path == 'id' && item.xpath) elementPath = item.xpath
+        if (this.settings.element_path == 'fullpath' && item.fullxpath) elementPath = item.fullxpath
+        if (elementPath) elementPath = 'xpath=' + elementPath
+
+        if (frameChain && elementPath) return frameChain + '|||>' + elementPath
+        return elementPath || frameChain
+    }
+
+    getElementPath(item) {
+        if (this.settings.event_type == "javascript") return ''
+
+        let iframePath = this.getXmlIframePath(item)
+        let path = ''
+
+        if (this.settings.element_path == 'css') {
+            path = item.csspath || item.fullcsspath || ''
+            if (path) path = 'css=' + path
+        } else {
+            if (this.settings.element_path == 'id' && item.xpath) path = item.xpath
+            if (this.settings.element_path == 'fullpath' && item.fullxpath) path = item.fullxpath
+            if (path) path = 'xpath=' + path
+        }
+
+        if (iframePath && path) {
+            return iframePath + '|||>' + path
+        }
+
         return path
     }
 
@@ -361,18 +407,40 @@ export class ptk_exporter {
         let command = ''
         if (item.eventTypeName == 'Navigate') command = 'open'
         else if (item.eventTypeName == 'Click') command = 'click'
+        else if (item.eventTypeName == 'SendKeys') command = 'sendKeys'
         else if (item.eventTypeName == 'SetValue') command = 'type'
+        else if (item.eventTypeName == 'Hover') command = 'hover'
+        else if (item.eventTypeName == 'SelectWindow') command = 'selectWindow'
+
+        const buildTargets = () => {
+            const options = item.targetOptions && item.targetOptions.length
+                ? item.targetOptions
+                : [
+                    item.csspath ? `css=${item.csspath}` : null,
+                    item.xpath ? `xpath=${item.xpath}` : null,
+                    item.fullxpath ? `xpath=${item.fullxpath}` : null
+                ].filter(Boolean)
+            return options.map((value) => {
+                if (value.startsWith('css=')) return [value.slice(4), "css:finder"]
+                if (value.startsWith('xpath=')) return [value.slice(6), "xpath:attributes"]
+                if (value.startsWith('id=')) return [value.slice(3), "id"]
+                if (value.startsWith('name=')) return [value.slice(5), "name"]
+                if (value.startsWith('linkText=')) return [value.slice(9), "linkText"]
+                return [value, "auto"]
+            })
+        }
+
+        const target = item.target
+            || (item.csspath ? `css=${item.csspath}` : null)
+            || (item.xpath ? `xpath=${item.xpath}` : null)
+            || ''
 
         return {
             "id": ptk_utils.UUID(),
             "comment": "",
             "command": command,
-            "target": item.csspath,
-            "targets": [
-                [item.csspath, "css:finder"],
-                [item.xpath, "xpath:attributes"],
-                [item.fullxpath, "xpath:position"],
-            ],
+            "target": target,
+            "targets": buildTargets(),
             "value": item.data
         }
     }

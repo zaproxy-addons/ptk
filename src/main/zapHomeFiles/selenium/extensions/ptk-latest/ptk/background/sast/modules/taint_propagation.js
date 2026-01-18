@@ -17,6 +17,7 @@ function isFunctionNode(node) {
 
 function originLabelForNode(node) {
   if (!node) return "";
+  if (node._ptkOriginLabel) return node._ptkOriginLabel;
   if (node.type === "Identifier") return node.name || "";
   if (node.type === "Literal") return node.raw || String(node.value || "");
   if (node.type === "MemberExpression") {
@@ -146,6 +147,97 @@ function propagateUrlParamsFlag(fromNode, targetNode) {
   }
 }
 
+function markUrlInstance(node) {
+  if (!node || typeof node !== "object") return;
+  node._ptkIsURLInstance = true;
+}
+
+function propagateUrlInstanceFlag(fromNode, targetNode) {
+  if (!fromNode?._ptkIsURLInstance || !targetNode) return;
+  if (targetNode.type === "Identifier") {
+    targetNode._ptkIsURLInstance = true;
+  } else if (targetNode.type === "MemberExpression" && targetNode.object) {
+    targetNode.object._ptkIsURLInstance = true;
+  }
+}
+
+function copyUrlSourceHint(fromNode, targetNode) {
+  if (!fromNode?._ptkUrlSourceHint || !targetNode) return;
+  const hint = fromNode._ptkUrlSourceHint;
+  if (targetNode.type === "Identifier") {
+    targetNode._ptkUrlSourceHint = hint;
+  } else if (targetNode.type === "MemberExpression" && targetNode.object) {
+    targetNode.object._ptkUrlSourceHint = hint;
+  }
+}
+
+function memberChainParts(node) {
+  if (!node || node.type !== "MemberExpression") return null;
+  const parts = [];
+  let cur = node;
+  while (cur && cur.type === "MemberExpression") {
+    const prop = memberPropName(cur);
+    if (prop == null) return null;
+    parts.unshift(prop);
+    cur = cur.object;
+  }
+  if (cur?.type === "Identifier") parts.unshift(cur.name);
+  else if (cur?.type === "ThisExpression") parts.unshift("this");
+  else return null;
+  return parts;
+}
+
+function calleeNameFromNew(node) {
+  if (!node || node.type !== "NewExpression") return null;
+  if (node.callee?.type === "Identifier") return node.callee.name;
+  if (node.callee?.type === "MemberExpression") {
+    const parts = memberChainParts(node.callee);
+    return parts ? parts.join(".") : null;
+  }
+  return null;
+}
+
+function normalizeUrlSourceHint(expr) {
+  if (!expr) return null;
+  if (expr.type === "MemberExpression") {
+    const parts = memberChainParts(expr);
+    if (!parts) return null;
+    const lowered = parts.map((p) => String(p).toLowerCase());
+    const tail = lowered.slice(-2).join(".");
+    if (tail === "location.hash") return "location.hash";
+    if (tail === "location.search") return "location.search";
+    if (tail === "location.href") return "location.href";
+    if (tail === "document.url") return "document.URL";
+    const tail3 = lowered.slice(-3).join(".");
+    if (tail3 === "document.location.href") return "location.href";
+    if (tail3 === "window.location.href") return "location.href";
+    if (tail3 === "window.location.hash") return "location.hash";
+    if (tail3 === "window.location.search") return "location.search";
+  }
+  if (expr.type === "CallExpression" && expr.callee?.type === "MemberExpression") {
+    const prop = memberPropName(expr.callee);
+    const name = prop ? prop.toLowerCase() : "";
+    if (["slice", "substring", "trim", "tostring", "concat"].includes(name)) {
+      return normalizeUrlSourceHint(expr.callee.object);
+    }
+  }
+  if ((expr.type === "CallExpression" || expr.type === "NewExpression") && expr.arguments?.length) {
+    let callName = null;
+    if (expr.type === "CallExpression") {
+      callName = calleeNameFromCall(expr);
+    } else if (expr.callee?.type === "Identifier") {
+      callName = expr.callee.name;
+    } else if (expr.callee?.type === "MemberExpression") {
+      callName = memberPropName(expr.callee) || null;
+    }
+    const lower = callName ? callName.toLowerCase() : "";
+    if (lower === "url" || lower.endsWith(".url") || lower.endsWith("urlsearchparams")) {
+      return normalizeUrlSourceHint(expr.arguments[0]);
+    }
+  }
+  return null;
+}
+
 function maybeMarkScriptFromCall(callNode, callName) {
   if (!callNode || !callName) return;
   const lower = callName.toLowerCase();
@@ -220,6 +312,130 @@ function buildSourceMatchers(catalog) {
   return out;
 }
 
+function buildCallPassthroughConfig(catalog) {
+  const config = {
+    matchers: [],
+    methods: new Set(),
+    anyMethod: false
+  };
+  const propagators = catalog?.propagators || {};
+  for (const entry of Object.values(propagators)) {
+    if (!entry || entry.kind !== "call_passthrough") continue;
+    const patterns = Array.isArray(entry.patterns)
+      ? entry.patterns
+      : (entry.pattern ? [entry.pattern] : []);
+    for (const pat of patterns) {
+      if (!pat || typeof pat !== "object") continue;
+      const call = pat.call || {};
+      const argIndex = (call && typeof call.argIndex === "number") ? call.argIndex : null;
+      try {
+        const fn = compilePattern(pat);
+        if (typeof fn === "function") {
+          config.matchers.push({ match: fn, argIndex });
+        }
+      } catch {
+        /* ignore invalid pattern */
+      }
+    }
+    const passthroughCalls = entry.propagate?.passthrough_call;
+    if (passthroughCalls === "*") {
+      config.anyMethod = true;
+    } else if (Array.isArray(passthroughCalls)) {
+      for (const name of passthroughCalls) {
+        if (typeof name === "string" && name.trim()) {
+          config.methods.add(name.toLowerCase());
+        }
+      }
+    }
+  }
+  return config;
+}
+
+function buildCtorConfig(catalog) {
+  const config = [];
+  const propagators = catalog?.propagators || {};
+  for (const entry of Object.values(propagators)) {
+    if (!entry || entry.kind !== "ctor") continue;
+    const patterns = Array.isArray(entry.patterns)
+      ? entry.patterns
+      : (entry.pattern ? [entry.pattern] : []);
+    for (const pat of patterns) {
+      if (!pat || typeof pat !== "object") continue;
+      const newSpec = pat.new || {};
+      const argIndex = (newSpec && typeof newSpec.argIndex === "number") ? newSpec.argIndex : 0;
+      try {
+        const fn = compilePattern(pat);
+        if (typeof fn === "function") {
+          config.push({ match: fn, argIndex, id: entry.id });
+        }
+      } catch {
+        /* ignore invalid pattern */
+      }
+    }
+  }
+  return config;
+}
+
+function buildPromiseAdapterConfig(catalog) {
+  const config = [];
+  const propagators = catalog?.propagators || {};
+  for (const entry of Object.values(propagators)) {
+    if (!entry || entry.kind !== "promise_adapter") continue;
+    const patterns = Array.isArray(entry.patterns)
+      ? entry.patterns
+      : (entry.pattern ? [entry.pattern] : []);
+    for (const pat of patterns) {
+      if (!pat || typeof pat !== "object") continue;
+      const callSpec = pat.call || {};
+      const argIndex = (callSpec && typeof callSpec.argIndex === "number") ? callSpec.argIndex : 0;
+      try {
+        const fn = compilePattern(pat);
+        if (typeof fn === "function") {
+          config.push({ match: fn, argIndex });
+        }
+      } catch {
+        /* ignore invalid pattern */
+      }
+    }
+  }
+  return config;
+}
+
+function buildCallbackAdapterConfig(catalog) {
+  const config = [];
+  const propagators = catalog?.propagators || {};
+  for (const entry of Object.values(propagators)) {
+    if (!entry || entry.kind !== "callback_adapter") continue;
+    const patterns = Array.isArray(entry.patterns)
+      ? entry.patterns
+      : (entry.pattern ? [entry.pattern] : []);
+    for (const pat of patterns) {
+      if (!pat || typeof pat !== "object") continue;
+      const callSpec = pat.call || {};
+      const argIndex = (callSpec && typeof callSpec.argIndex === "number") ? callSpec.argIndex : 0;
+      try {
+        const fn = compilePattern(pat);
+        if (typeof fn === "function") {
+          const wantsReturn = typeof entry.id === "string" && entry.id.includes("array_map");
+          config.push({ match: fn, argIndex, wantsReturn });
+        }
+      } catch {
+        /* ignore invalid pattern */
+      }
+    }
+  }
+  return config;
+}
+
+function hasReturnPassthrough(catalog) {
+  const propagators = catalog?.propagators || {};
+  for (const entry of Object.values(propagators)) {
+    if (!entry || entry.kind !== "return_passthrough") continue;
+    if (entry.propagate?.return_value) return true;
+  }
+  return false;
+}
+
 function buildSourceTaintKindMap(modules) {
   const map = new Map();
   if (!Array.isArray(modules)) return map;
@@ -274,6 +490,7 @@ function addOriginForNode(node, matcher, graph, originTable, fileCache, sourceTa
   );
   const originId = originTable.length;
   originTable.push(origin);
+  graph.markNodeAsSource(nodeId);
   graph.markNodeWithOrigin(nodeId, originId);
   return originId;
 }
@@ -506,6 +723,11 @@ export function buildGlobalTaintContext(ast, options = {}) {
   const originTable = [];
   const sanitizerIndex = buildSanitizerIndex(options.catalog || {});
   const sourceMatchers = buildSourceMatchers(options.catalog || {});
+  const callPassthroughConfig = buildCallPassthroughConfig(options.catalog || {});
+  const ctorConfig = buildCtorConfig(options.catalog || {});
+  const promiseAdapterConfig = buildPromiseAdapterConfig(options.catalog || {});
+  const callbackAdapterConfig = buildCallbackAdapterConfig(options.catalog || {});
+  const returnPassthroughEnabled = hasReturnPassthrough(options.catalog || {});
   const sourceTaintKindMap = buildSourceTaintKindMap(options.modules || []);
   const fnIndex = buildFunctionIndex(ast);
 
@@ -558,6 +780,51 @@ export function buildGlobalTaintContext(ast, options = {}) {
       const fn = resolveFnFromBinding(binding);
       if (fn) markFunctionParamsAsMessage(fn);
     }
+  }
+
+  function attachCallbackParams(handlerNode, scope, sourceNode, opts = {}) {
+    if (!handlerNode || !sourceNode) return;
+    const attachParams = (fnNode) => {
+      if (!fnNode || !Array.isArray(fnNode.params)) return;
+      for (const param of fnNode.params) {
+        if (param && param.type === "Identifier") {
+          graph.addEdge(sourceNode, param, opts.edgeKind || "callback_param");
+        }
+      }
+      if (opts.returnToCall) {
+        const retNode = fnIndex.returnNodeByFn.get(fnNode);
+        if (retNode) {
+          graph.nodeIdForAstNode(retNode);
+          graph.addEdge(retNode, opts.returnToCall, "callback_return");
+        }
+      }
+    };
+    const resolveHandler = (node) => {
+      if (!node) return;
+      if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") {
+        attachParams(node);
+        return;
+      }
+      if (node.type === "Identifier") {
+        const binding = lookup(scope, node.name);
+        const fn = resolveFnFromBinding(binding);
+        if (fn) attachParams(fn);
+      }
+    };
+    if (handlerNode.type === "ObjectExpression") {
+      for (const prop of handlerNode.properties || []) {
+        if (!prop || prop.type !== "Property") continue;
+        const keyName = prop.key?.type === "Identifier"
+          ? prop.key.name
+          : (prop.key?.type === "Literal" ? String(prop.key.value) : null);
+        if (!keyName) continue;
+        const lowerKey = keyName.toLowerCase();
+        if (lowerKey !== "next" && lowerKey !== "error" && lowerKey !== "complete") continue;
+        resolveHandler(prop.value);
+      }
+      return;
+    }
+    resolveHandler(handlerNode);
   }
 
   function canonicalNameForExpr(expr, scope) {
@@ -653,6 +920,8 @@ export function buildGlobalTaintContext(ast, options = {}) {
           }
           propagateScriptFlag(node.init, idNode);
           propagateUrlParamsFlag(node.init, idNode);
+          propagateUrlInstanceFlag(node.init, idNode);
+          copyUrlSourceHint(node.init, idNode);
           const canonical = canonicalNameForExpr(node.init, scope);
           if (canonical) idNode._ptkCanonicalName = canonical;
         }
@@ -681,6 +950,8 @@ export function buildGlobalTaintContext(ast, options = {}) {
         const targetForFlag = node.left.type === "Identifier" ? node.left : (node.left.type === "MemberExpression" ? node.left.object : null);
         propagateScriptFlag(node.right, targetForFlag);
         propagateUrlParamsFlag(node.right, targetForFlag);
+        propagateUrlInstanceFlag(node.right, targetForFlag);
+        copyUrlSourceHint(node.right, targetForFlag);
         return;
       }
 
@@ -689,7 +960,7 @@ export function buildGlobalTaintContext(ast, options = {}) {
           visit(node.argument, scope, nextParents, activeFnStack);
           const fnNode = [...parents].reverse().find((p) => p && (p.type === "FunctionDeclaration" || p.type === "FunctionExpression" || p.type === "ArrowFunctionExpression"));
           const retNode = fnIndex.returnNodeByFn.get(fnNode);
-          if (retNode) {
+          if (retNode && returnPassthroughEnabled) {
             graph.nodeIdForAstNode(retNode);
             graph.addEdge(node.argument, retNode, "return");
           }
@@ -699,6 +970,9 @@ export function buildGlobalTaintContext(ast, options = {}) {
 
       case "MemberExpression": {
         if (node.object?._ptkIsScript) node._ptkIsScript = true;
+        if (node.object?._ptkIsURLInstance) node._ptkIsURLInstance = true;
+        if (node.object?._ptkIsURLSearchParams) node._ptkIsURLSearchParams = true;
+        if (node.object?._ptkUrlSourceHint) node._ptkUrlSourceHint = node.object._ptkUrlSourceHint;
         if (node.object) visit(node.object, scope, nextParents, activeFnStack);
         if (node.property) visit(node.property, scope, nextParents, activeFnStack);
         if (node.object) graph.addEdge(node.object, node, "member");
@@ -710,8 +984,6 @@ export function buildGlobalTaintContext(ast, options = {}) {
           : (node.property && node.property.type === "Literal" ? String(node.property.value) : null);
         const objIdent = (!node.computed && node.object && node.object.type === "Identifier") ? node.object : null;
         if (propName === "data" && objIdent) {
-          const objId = graph.nodeIdForAstNode(objIdent);
-          const hasOrigins = objId ? (graph.getOrigins(objId)?.size > 0) : false;
           if (objIdent._ptkIsMessageParam) {
             addOriginForNode(
               node,
@@ -721,22 +993,12 @@ export function buildGlobalTaintContext(ast, options = {}) {
               fileCache,
               sourceTaintKindMap
             );
-          } else if (!hasOrigins) {
-            const objName = (objIdent.name || "").toLowerCase();
-            const likelyMsg = ["e", "ev", "evt", "event", "message", "msg"].includes(objName);
-            if (likelyMsg) {
-              const fallbackId = addOriginForNode(
-                node,
-                { originKind: "dom-input", id: MESSAGE_FALLBACK_ORIGIN_ID },
-                graph,
-                originTable,
-                fileCache,
-                sourceTaintKindMap
-              );
-              const nodeId = graph.nodeIdForAstNode(node);
-              if (nodeId && fallbackId != null) fallbackOrigins.push({ nodeId, originId: fallbackId, objNodeId: objId || null });
-            }
           }
+        }
+        if (propName === "searchParams" && node.object?._ptkIsURLInstance) {
+          markUrlParamsNode(node);
+          if (node.object?._ptkUrlSourceHint) node._ptkUrlSourceHint = node.object._ptkUrlSourceHint;
+          if (node.object) graph.addEdge(node.object, node, "url_searchparams");
         }
         break;
       }
@@ -748,7 +1010,10 @@ export function buildGlobalTaintContext(ast, options = {}) {
 
       case "CallExpression":
       case "NewExpression": {
-        const callName = calleeNameFromCall(node);
+        const callName =
+          node.type === "CallExpression"
+            ? calleeNameFromCall(node)
+            : calleeNameFromNew(node);
         const lowerName = callName ? callName.toLowerCase() : "";
         if (node.type === "CallExpression" && (node.callee?.type === "FunctionExpression" || node.callee?.type === "ArrowFunctionExpression")) {
           const params = node.callee.params || [];
@@ -775,37 +1040,96 @@ export function buildGlobalTaintContext(ast, options = {}) {
           maybeMarkScriptFromCall(node, callName);
         }
         const callNameLower = callName ? callName.toLowerCase() : "";
-        const isUrlCtor = callNameLower === "url" || callNameLower.endsWith(".url");
-        if ((node.type === "NewExpression" || node.type === "CallExpression") && isUrlCtor) {
-          if (node.arguments?.[0]) graph.addEdge(node.arguments[0], node, "url_ctor");
-        }
-        const isUrlParamsCtor = callNameLower.endsWith("urlsearchparams");
-        if ((node.type === "NewExpression" || node.type === "CallExpression") && isUrlParamsCtor) {
-          markUrlParamsNode(node);
-          if (node.arguments?.[0]) {
-            graph.addEdge(node.arguments[0], node, "urlsp_ctor");
-          }
-        }
-        if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
-          const prop = memberPropName(node.callee);
-          if (prop && prop.toLowerCase() === "get") {
-            const obj = node.callee.object;
-            if (obj?._ptkIsURLSearchParams) {
-              graph.addEdge(obj, node, "urlsp_get");
-            }
-          }
-          if (prop && prop.toLowerCase() === "split" && node.callee.object) {
-            graph.addEdge(node.callee.object, node, "string_split");
-          }
-        }
-        if (node.type === "CallExpression" && callNameLower.endsWith("decodeuricomponent")) {
-          const arg = node.arguments?.[0];
-          if (arg) graph.addEdge(arg, node, "decode_uri");
-        }
         if (callName && sanitizerIndex.has(callName)) {
           const ids = sanitizerIndex.get(callName);
           const callId = graph.nodeIdForAstNode(node);
           graph.markNodeAsSanitized(callId, ids);
+        }
+
+        if (node.type === "CallExpression") {
+          for (const adapter of promiseAdapterConfig) {
+            let matched = false;
+            try {
+              matched = adapter.match(node, parents);
+            } catch {
+              matched = false;
+            }
+            if (!matched) continue;
+            if (node.callee?.type === "MemberExpression") {
+              const receiver = node.callee.object;
+              const handlerArg = node.arguments?.[adapter.argIndex];
+              if (receiver && handlerArg) {
+                attachCallbackParams(handlerArg, scope, receiver, { edgeKind: "promise_then" });
+              }
+            }
+          }
+          for (const adapter of callbackAdapterConfig) {
+            let matched = false;
+            try {
+              matched = adapter.match(node, parents);
+            } catch {
+              matched = false;
+            }
+            if (!matched) continue;
+            if (node.callee?.type === "MemberExpression") {
+              const receiver = node.callee.object;
+              const handlerArg = node.arguments?.[adapter.argIndex];
+              if (receiver && handlerArg) {
+                attachCallbackParams(handlerArg, scope, receiver, {
+                  edgeKind: "callback_adapter",
+                  returnToCall: adapter.wantsReturn ? node : null
+                });
+              }
+            }
+          }
+        }
+
+        if (node.type === "NewExpression") {
+          for (const entry of ctorConfig) {
+            let matched = false;
+            try {
+              matched = entry.match(node, parents);
+            } catch {
+              matched = false;
+            }
+            if (!matched) continue;
+            const arg = node.arguments?.[entry.argIndex];
+            if (arg) graph.addEdge(arg, node, "ctor");
+            if (entry.id === "prop:url_ctor") {
+              markUrlInstance(node);
+              const hint = normalizeUrlSourceHint(arg);
+              if (hint) node._ptkUrlSourceHint = hint;
+            }
+            if (entry.id === "prop:urlsearchparams_ctor") {
+              markUrlParamsNode(node);
+              const hint = normalizeUrlSourceHint(arg);
+              if (hint) node._ptkUrlSourceHint = hint;
+            }
+          }
+        }
+
+        if (node.type === "CallExpression") {
+          for (const matcher of callPassthroughConfig.matchers) {
+            try {
+              if (!matcher.match(node, parents)) continue;
+            } catch {
+              continue;
+            }
+            if (typeof matcher.argIndex === "number" && node.arguments?.[matcher.argIndex]) {
+              graph.addEdge(node.arguments[matcher.argIndex], node, "call_passthrough");
+            } else if (node.callee?.type === "MemberExpression" && node.callee.object) {
+              graph.addEdge(node.callee.object, node, "call_passthrough");
+            }
+          }
+          if (node.callee?.type === "MemberExpression") {
+            const prop = memberPropName(node.callee);
+            if (prop) {
+              const propLower = prop.toLowerCase();
+              if (callPassthroughConfig.anyMethod || callPassthroughConfig.methods.has(propLower)) {
+                if (node.callee.object) graph.addEdge(node.callee.object, node, "call_passthrough");
+              }
+            }
+          }
         }
 
         // Known function mapping: arg -> param, return -> call result
@@ -832,6 +1156,26 @@ export function buildGlobalTaintContext(ast, options = {}) {
         break;
       }
 
+      case "AwaitExpression": {
+        let matched = false;
+        for (const adapter of promiseAdapterConfig) {
+          try {
+            if (adapter.match(node, parents)) {
+              matched = true;
+              break;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        if (matched && node.argument) {
+          visit(node.argument, scope, nextParents, activeFnStack);
+          graph.addEdge(node.argument, node, "await");
+          return;
+        }
+        break;
+      }
+
       case "Identifier": {
         const isDecl = parents[parents.length - 2]?.type === "VariableDeclarator" && parents[parents.length - 2].id === node;
         const isParam = parents[parents.length - 2]?.type === "FunctionDeclaration" || parents[parents.length - 2]?.type === "FunctionExpression" || parents[parents.length - 2]?.type === "ArrowFunctionExpression";
@@ -843,6 +1187,8 @@ export function buildGlobalTaintContext(ast, options = {}) {
             if (binding._ptkIsScript) node._ptkIsScript = true;
             if (binding._ptkIsMessageParam) node._ptkIsMessageParam = true;
             if (binding._ptkIsURLSearchParams) node._ptkIsURLSearchParams = true;
+            if (binding._ptkIsURLInstance) node._ptkIsURLInstance = true;
+            if (binding._ptkUrlSourceHint) node._ptkUrlSourceHint = binding._ptkUrlSourceHint;
             if (binding._ptkCanonicalName) node._ptkCanonicalName = binding._ptkCanonicalName;
           }
         }
@@ -877,6 +1223,32 @@ export function buildGlobalTaintContext(ast, options = {}) {
       for (const fn of matcher.compiled) {
         try {
           if (fn(node, parents)) {
+            if (
+              node.type === "MemberExpression" &&
+              parents[parents.length - 1] &&
+              parents[parents.length - 1].type === "MemberExpression" &&
+              parents[parents.length - 1].object === node
+            ) {
+              const parentNode = parents[parents.length - 1];
+              let parentIsSource = false;
+              for (const parentMatcher of sourceMatchers) {
+                if (parentMatcher.compiled.length === 0) continue;
+                for (const parentFn of parentMatcher.compiled) {
+                  try {
+                    if (parentFn(parentNode, parents.slice(0, -1))) {
+                      parentIsSource = true;
+                      break;
+                    }
+                  } catch {
+                    /* ignore matcher errors */
+                  }
+                }
+                if (parentIsSource) break;
+              }
+              if (parentIsSource) {
+                return; // suppress base origin only when parent member is also a source
+              }
+            }
             addOriginForNode(node, matcher, graph, originTable, fileCache, sourceTaintKindMap);
             return; // one match per node is enough
           }
@@ -967,6 +1339,9 @@ export function queryTaintForRule(globalCtx, rulePack, sinkPayloadNode, queryOpt
     }
 
     const upstream = graph.getUpstream(cur.nodeId);
+    if (graph.isSourceNode && graph.isSourceNode(cur.nodeId)) {
+      continue;
+    }
     for (const edge of upstream) {
       const key = stateKey(edge.fromNodeId, nextSanitized);
       if (visited.has(key)) continue;

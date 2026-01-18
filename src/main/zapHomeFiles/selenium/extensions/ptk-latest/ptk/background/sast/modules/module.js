@@ -2,7 +2,7 @@
 
 import { queryTaintForRule } from "./taint_propagation.js";
 import { reportTaintFinding, reportPatternFinding, exprToShortLabel } from "./reporting.js";
-import { compilePattern, calleeNameFromPattern } from "./_internals.js";
+import { compilePattern, calleeNameFromPattern, getEventHandlerSink, isDomSelectorCall } from "./_internals.js";
 
 /* ────────────────────────────── Helpers ────────────────────────────── */
 
@@ -56,6 +56,8 @@ function _applySinkGuard(kind, node) {
   if (!kind) return true;
   if (kind === "script_text") return _guardScriptText(node);
   if (kind === "exclude_location") return _guardExcludeLocation(node);
+  if (kind === "dom_selector") return !!isDomSelectorCall(node);
+  if (kind === "event_handler_string") return !!getEventHandlerSink(node);
   return true;
 }
 
@@ -113,6 +115,20 @@ function _pickFileFromNode(node, ctx) {
   return node?.sourceFile || node?.loc?.sourceFile || ctx?.codeFile || ctx?.file || null;
 }
 
+function _stringValueFromNode(node) {
+  if (!node) return null;
+  if (node.type === "Literal" && typeof node.value === "string") return node.value;
+  if (node.type === "TemplateLiteral" && (node.expressions || []).length === 0) {
+    return (node.quasis || []).map((q) => q?.value?.cooked || "").join("");
+  }
+  return null;
+}
+
+function _normalizeRegexPattern(raw) {
+  if (typeof raw !== "string") return raw;
+  return raw.replace(/\u0008/g, "\\b");
+}
+
 /* ────────────────────────────── Rule compilation ────────────────────────────── */
 
 function compileSinkMatchers(sinks, catalogs) {
@@ -127,6 +143,7 @@ function compileSinkMatchers(sinks, catalogs) {
     const guardKind = (overlay && overlay.guard) || (cat && cat.guard) || null;
     return {
       id,
+      meta: cat || null,
       match: (node, ancestors) => {
         try {
           const hit = compiled.some((c) => c.match(node, ancestors));
@@ -198,6 +215,57 @@ function compilePatternMatchers(rule, compileFn) {
   if (!Array.isArray(rule.matches) || !compileFn) return out;
   for (const pat of rule.matches) {
     const nodeType = typeOf(pat);
+    if (nodeType === "comment") {
+      const spec = pat.comment || {};
+      const re = spec.regex ? new RegExp(_normalizeRegexPattern(spec.regex), spec.flags || "") : null;
+      out.push({
+        id: "pattern",
+        nodeType,
+        matchComment: (comment) => {
+          if (!comment || typeof comment.text !== "string" || !re) return false;
+          return re.test(comment.text);
+        }
+      });
+      continue;
+    }
+    if (nodeType === "string") {
+      const spec = pat.string || {};
+      const re = spec.regex ? new RegExp(_normalizeRegexPattern(spec.regex), spec.flags || "") : null;
+      out.push({
+        id: "pattern",
+        nodeType,
+        match: (node) => {
+          if (!node || !re) return false;
+          const value = _stringValueFromNode(node);
+          return value != null && re.test(value);
+        }
+      });
+      continue;
+    }
+    if (nodeType === "declarator") {
+      const spec = pat.declarator || {};
+      const leftSpec = spec.left || {};
+      const rightSpec = spec.right || {};
+      const re = leftSpec.identifierRegex
+        ? new RegExp(_normalizeRegexPattern(leftSpec.identifierRegex), leftSpec.caseInsensitive ? "i" : "")
+        : null;
+      const requireString = !!rightSpec.isString;
+      out.push({
+        id: "pattern",
+        nodeType,
+        match: (node) => {
+          if (!node || node.type !== "VariableDeclarator") return false;
+          if (!node.id || node.id.type !== "Identifier") return false;
+          if (re && !re.test(node.id.name)) return false;
+          if (requireString) {
+            const value = _stringValueFromNode(node.init);
+            if (value == null) return false;
+          }
+          return true;
+        }
+      });
+      continue;
+    }
     try {
       const fn = compileFn(pat);
       if (typeof fn === "function") {
@@ -330,7 +398,7 @@ export class ptk_sast_module {
     return reportPatternFinding({ rule: pack, context, matchNode: node, extras });
   }
 
-  _emitTaintFinding(pack, node, ctx, hit, globalTaintCtx, trace) {
+  _emitTaintFinding(pack, node, ctx, hit, globalTaintCtx, trace, sinkMeta) {
     const mode = "taint";
     const context = { ...ctx, module_metadata: this.module_metadata, metadata: pack.metadata, codeFile: ctx.codeFile || ctx.file, mode };
     const code = ctx.codeByFile?.[ctx.codeFile || ctx.file];
@@ -340,7 +408,8 @@ export class ptk_sast_module {
       sourceExact: hit.origin ? hit.origin.label : undefined,
       module_metadata: this.module_metadata,
       graph: globalTaintCtx?.graph || null,
-      pathKeys: hit.pathKeys || []
+      pathKeys: hit.pathKeys || [],
+      sinkMeta: sinkMeta || null
     };
     return reportTaintFinding({
       rule: pack,
@@ -395,18 +464,43 @@ export class ptk_sast_module {
     const findings = [];
     if (!masterAST || typeof ancestorWalk !== "function") return findings;
 
-    const policy = options.policy || 0;
+    const scanStrategy = options.scanStrategy ?? options.policy ?? 0;
     const globalTaintCtx = options.globalTaintCtx || null;
     this._taintDedup.clear();
 
     const packs = (this.rules || []).filter(Boolean);
     if (!packs.length) return findings;
 
+    if (scanStrategy === 0) {
+      const comments = Array.isArray(ctx?.comments) ? ctx.comments : [];
+      if (comments.length) {
+        for (const pack of packs) {
+          if (pack.metadata.mode !== "pattern") continue;
+          const commentMatchers = (pack.matches || []).filter((m) => m.nodeType === "comment" && typeof m.matchComment === "function");
+          if (!commentMatchers.length) continue;
+          for (const comment of comments) {
+            for (const m of commentMatchers) {
+              if (!m.matchComment(comment)) continue;
+              const commentNode = {
+                type: "Comment",
+                loc: comment.loc,
+                sourceFile: comment.sourceFile
+              };
+              const finding = this._emitPatternFinding(pack, commentNode, ctx);
+              if (finding) findings.push(finding);
+              if (findings.length >= (this.maxFindings || Infinity)) return findings;
+            }
+          }
+        }
+      }
+    }
+
     const self = this;
     const processNode = (node, ancestors) => {
       for (const pack of packs) {
-        if (pack.metadata.mode === "pattern" && policy === 0) {
+        if (pack.metadata.mode === "pattern" && scanStrategy === 0) {
           for (const m of (pack.matches || [])) {
+            if (typeof m.match !== "function") continue;
             if (m.match(node, ancestors)) {
               const finding = self._emitPatternFinding(pack, node, ctx);
               if (finding) findings.push(finding);
@@ -422,11 +516,10 @@ export class ptk_sast_module {
             const hits = queryTaintForRule(globalTaintCtx, pack, payload, { sinkNode: node }) || [];
             for (const hit of hits) {
               const trace = this._buildTraceFromPath(hit, globalTaintCtx.graph, ctx.codeByFile || {}, ctx);
-              const finding = this._emitTaintFinding(pack, node, ctx, hit, globalTaintCtx, trace);
+              const finding = this._emitTaintFinding(pack, node, ctx, hit, globalTaintCtx, trace, s.meta);
               if (!finding) continue;
               const key = this._dedupKey(pack, hit.origin, node);
               if (this._taintDedup.has(key)) {
-                console.debug("[TAINT-DEDUP] skipping duplicate", key);
                 continue;
               }
               this._taintDedup.set(key, true);
@@ -443,6 +536,9 @@ export class ptk_sast_module {
       MemberExpression: processNode,
       AssignmentExpression: processNode,
       NewExpression: processNode,
+      VariableDeclarator: processNode,
+      Literal: processNode,
+      TemplateLiteral: processNode,
     };
 
     try {

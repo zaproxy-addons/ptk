@@ -2,11 +2,31 @@
 
 export class ptk_controller_index {
 
-    init() {
+    init(options = {}) {
         let self = this
-        return browser.runtime.sendMessage({ channel: "ptk_popup2background_dashboard", type: "init" })
+        return browser.runtime.sendMessage({
+            channel: "ptk_popup2background_dashboard",
+            type: "init",
+            ...options
+        })
             .then(function (result) {
+                const previous = Object.assign({}, self)
                 Object.assign(self, result)
+                if (options?.tabId) {
+                    self.tabId = options.tabId
+                    if (options.url) self.url = options.url
+                    if (result?.activeTab) {
+                        result.activeTab = Object.assign({}, result.activeTab, {
+                            tabId: options.tabId,
+                            url: options.url || result.activeTab.url
+                        })
+                    }
+                }
+                if (result?.lite) {
+                    if (!result.tab && previous.tab) self.tab = previous.tab
+                    if (!result.storage && previous.storage) self.storage = previous.storage
+                    if (!result.cookies && previous.cookies) self.cookies = previous.cookies
+                }
                 return self
             }).catch(e => e)
     }
@@ -30,6 +50,15 @@ export class ptk_controller_index {
         return browser.runtime.sendMessage({ channel: "ptk_popup2background_dashboard", type: "save", items: items }).catch(e => e)
     }
 
+    async getFullDashboard() {
+        let self = this
+        return browser.runtime.sendMessage({ channel: "ptk_popup2background_dashboard", type: "get_full_dashboard" })
+            .then(function (result) {
+                Object.assign(self, result)
+                return self
+            }).catch(e => e)
+    }
+
     async runBackroungScan(tabId, host, domains, scans, settings) {
         return browser.runtime.sendMessage({
             channel: "ptk_popup2background_dashboard",
@@ -51,6 +80,16 @@ export class ptk_controller_index {
             scans: scans
         }).then(response => {
             return response
+        }).catch(e => e)
+    }
+
+    // Request fresh tab analysis when cached data is missing
+    async requestTabAnalysis(tabId, url) {
+        return browser.runtime.sendMessage({
+            channel: "ptk_popup2background_dashboard",
+            type: "request_tab_analysis",
+            tabId,
+            url
         }).catch(e => e)
     }
 

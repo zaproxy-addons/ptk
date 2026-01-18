@@ -17,6 +17,7 @@ export class ptk_proxy {
         this._createdTab = null
         this._activeTab = null
         this._previousTab = null
+        this._dashboardTab = null
         this.tabUrlMap = new Map()
         this._tabActivity = new Map()
 
@@ -111,11 +112,16 @@ export class ptk_proxy {
         if (info?.url && ptk_utils.isURL(info.url)) {
             this.tabUrlMap.set(tabId, info.url)
         }
+        if (this._dashboardTab?.tabId === tabId) {
+            const url = tab?.url || info?.url || this._dashboardTab.url
+            this._dashboardTab = { tabId, url: url || this._dashboardTab.url, window: tab?.windowId || this._dashboardTab.window }
+        }
     }
 
     onRemoved(tabId, info) {
         if (this._previousTab && this._activeTab?.tabId == tabId) this._activeTab = this._previousTab
         if (this.tabUrlMap.has(tabId)) this.tabUrlMap.delete(tabId)
+        if (this._dashboardTab?.tabId === tabId) this._dashboardTab = null
     }
 
     onBeforeRequest(request) {
@@ -339,6 +345,20 @@ export class ptk_proxy {
         return this._activeTab
     }
 
+    setDashboardTab(tabId, url = '') {
+        if (tabId == null) return
+        const resolvedUrl = url || this.tabUrlMap.get(tabId) || ''
+        this._dashboardTab = { tabId, url: resolvedUrl }
+    }
+
+    getDashboardTab() {
+        if (this._dashboardTab?.tabId != null) {
+            const url = this._dashboardTab.url || this.tabUrlMap.get(this._dashboardTab.tabId) || ''
+            return { tabId: this._dashboardTab.tabId, url }
+        }
+        return this.activeTab
+    }
+
     getUiUrl(tabId, fallback = '') {
         return this.tabUrlMap.get(tabId) || fallback
     }
@@ -355,6 +375,11 @@ export class ptk_proxy {
     trackTabActivity(tabId) {
         if (tabId == null) return
         this._tabActivity.set(String(tabId), Date.now())
+    }
+
+    getTabActivity(tabId) {
+        if (tabId == null) return 0
+        return this._tabActivity.get(String(tabId)) || 0
     }
 
     forgetTab(tabId) {
@@ -384,9 +409,12 @@ export class ptk_tab {
         this.frames = new Map()
         this.setParams(params, type)
         this.tabInfo = null
+        this.tabInfoDirty = true
+        this.lastAnalyzedAt = 0
     }
 
     setParams(params, type) {
+        this.tabInfoDirty = true
         if (Number.isInteger(params.frameId)) {
             //Init frame map if doesn't exist
             if (!this.frames.has(params.frameId)) {
@@ -428,6 +456,9 @@ export class ptk_tab {
                 }
             })
         })
+        if (updated) {
+            this.tabInfoDirty = true
+        }
         if (updated) browser.runtime.sendMessage({
             channel: "ptk_background2popup_tabs",
             type: "requests source resized"
@@ -435,51 +466,84 @@ export class ptk_tab {
     }
 
     async analyze() {
+        const cacheAgeMs = Date.now() - (this.lastAnalyzedAt || 0)
+        if (!this.tabInfoDirty && this.tabInfo && cacheAgeMs < 5000) {
+            return this.tabInfo
+        }
+
+        // Use Sets for O(1) lookups instead of O(n) array.includes()
+        const urlSet = new Set()
+        const domainSet = new Set()
+        const ipSet = new Set()
+
         let requestHeaders = {},
-            responseHeaders = new Array(),
-            domains = new Array(),
-            fqdnIP = new Array(),
-            urls = new Array(),
-            frames = new Array(),
-            requests = new Array()
+            responseHeaders = {},
+            fqdnIP = [],
+            frames = [],
+            requests = []
+
         this.frames.forEach((fV, fK) => {
-            let i = 0, data = {}, ip = ''
+            let i = 0, data = {}, ipList = []
             fV.forEach((rV, rK) => {
                 rV.forEach((request, key) => {
                     try {
-                        if (!urls.includes(request.url)) urls.push(request.url)
+                        // O(1) Set lookup instead of O(n) array.includes()
+                        if (request.url && !urlSet.has(request.url)) {
+                            urlSet.add(request.url)
+                        }
 
-                        let hostname = (new URL(request.url)).hostname
-                        if (!domains.includes(hostname)) {
-                            domains.push(hostname)
+                        const hostname = (new URL(request.url)).hostname
+                        if (!domainSet.has(hostname)) {
+                            domainSet.add(hostname)
                             fqdnIP.push([hostname, request.ip])
                         }
 
-                        request.requestHeaders.forEach((hV, hK) => {
-                            if (!(hV.name in requestHeaders))
-                                requestHeaders[hV.name.toLowerCase()] = [hV.value]
-                        })
+                        if (request.requestHeaders) {
+                            request.requestHeaders.forEach((hV) => {
+                                const headerName = hV.name.toLowerCase()
+                                if (!(headerName in requestHeaders)) {
+                                    requestHeaders[headerName] = [hV.value]
+                                }
+                            })
+                        }
 
-                        request.responseHeaders.forEach((hV, hK) => {
-                            if (!(hV.name.toLowerCase() in responseHeaders))
-                                responseHeaders[hV.name.toLowerCase()] = [hV.value]
-
-                        })
+                        if (request.responseHeaders) {
+                            request.responseHeaders.forEach((hV) => {
+                                const headerName = hV.name.toLowerCase()
+                                if (!(headerName in responseHeaders)) {
+                                    responseHeaders[headerName] = [hV.value]
+                                }
+                            })
+                        }
 
                         if (i == 0) {
-                            ip = request.ip ? request.ip : ''
                             data.frame = request.parentFrameId == -1 ? "main" : "iframe"
                             data.url = hostname
                         }
-                        if (request.ip && ip.indexOf(request.ip) < 0) ip += ", " + request.ip
+                        if (request.ip && !ipSet.has(request.ip)) {
+                            ipSet.add(request.ip)
+                            ipList.push(request.ip)
+                        }
                         i++
                     } catch (e) { }
                 })
             })
-            frames.push(['', fK, data.frame, data.url, ip])
+            frames.push(['', fK, data.frame, data.url, ipList.join(', ')])
         })
 
-        return { responseHeaders: responseHeaders, requestHeaders: requestHeaders, frames: frames, requests: requests, domains: domains, urls: urls, fqdnIP: fqdnIP }
+        // Convert Sets to Arrays for the result
+        this.tabInfo = {
+            responseHeaders,
+            requestHeaders,
+            frames,
+            requests,
+            domains: Array.from(domainSet),
+            urls: Array.from(urlSet),
+            fqdnIP
+        }
+        this.tabInfoDirty = false
+        this.lastAnalyzedAt = Date.now()
+        return this.tabInfo
     }
 
 }

@@ -1,5 +1,8 @@
 /* Author: PTK */
 
+if (!window.__ptkSpaHarnessLoaded) {
+    window.__ptkSpaHarnessLoaded = true
+
 const spaJsEvents = []
 const xssExecutionEvents = []
 const leakEvents = []
@@ -372,9 +375,28 @@ async function runSpaParamTest({ param, payload, checks = [], markerDomain, mark
     }
 }
 
-browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg?.type === 'spaParamTest') {
-        runSpaParamTest(msg).then(sendResponse)
-        return true
-    }
-})
+const spaRuntime = (typeof browser !== 'undefined' && browser.runtime)
+    ? browser.runtime
+    : ((typeof chrome !== 'undefined' && chrome.runtime) ? chrome.runtime : null)
+
+if (spaRuntime?.onMessage?.addListener) {
+    spaRuntime.onMessage.addListener((msg, sender, sendResponse) => {
+        if (msg?.type === 'spaPing') {
+            if (sendResponse) sendResponse({ ok: true })
+            return false
+        }
+        if (msg?.type === 'spaParamTest') {
+            Promise.resolve()
+                .then(() => runSpaParamTest(msg))
+                .then(result => {
+                    if (sendResponse) sendResponse(result)
+                })
+                .catch(err => {
+                    const message = err && err.message ? err.message : String(err || 'unknown error')
+                    if (sendResponse) sendResponse({ error: message })
+                })
+            return true
+        }
+    })
+}
+}

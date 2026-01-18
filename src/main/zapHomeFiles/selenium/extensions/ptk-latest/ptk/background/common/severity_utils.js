@@ -1,5 +1,13 @@
+import { normalizeCwe, normalizeOwasp } from "./normalizeMappings.js"
+
 const DEFAULT_SEVERITY = 'medium'
 const VALID_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info']
+
+function applyMappingNormalization(meta) {
+  if (!meta || typeof meta !== 'object') return
+  meta.owasp = normalizeOwasp(meta.owasp)
+  meta.cwe = normalizeCwe(meta.cwe)
+}
 
 function coerceSeverity(value) {
   if (value === null || value === undefined) return null
@@ -42,6 +50,8 @@ export function normalizeChildDefinition(child, { engine = 'Engine', parentId = 
     delete child.severity
   }
 
+  applyMappingNormalization(meta)
+
   return child
 }
 
@@ -55,6 +65,8 @@ export function normalizeModuleDefinition(moduleDef, { engine = 'Engine', childK
     console.warn(`[PTK ${engine}] module "${moduleDef.id || moduleDef.name || 'unknown'}" missing metadata.severity; defaulting to "medium"`)
     meta.severity = DEFAULT_SEVERITY
   }
+
+  applyMappingNormalization(meta)
 
   if (childKey && Array.isArray(moduleDef[childKey])) {
     moduleDef[childKey] = moduleDef[childKey].map((child, index) =>

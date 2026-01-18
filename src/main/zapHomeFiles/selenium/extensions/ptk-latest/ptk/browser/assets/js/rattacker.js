@@ -8,6 +8,30 @@ import { normalizeScanResult } from "../js/scanResultViewModel.js"
 
 const controller = new ptk_controller_rattacker()
 const request_controller = new ptk_controller_rbuilder()
+
+const DAST_RENDER = {
+    queue: [],
+    timer: null,
+    flushMs: 350,
+    renderedRequestIds: new Set(),
+    renderedAttackIds: new Set(),
+    scanning: false,
+    legacyBound: false,
+    progressTimer: null,
+    progressFlushMs: 20,
+    progressName: '',
+    lastActivityAt: 0,
+    idleCheckTimer: null,
+    idleSorted: false
+}
+const attackFilterState = {
+    scope: 'all',
+    requestId: null
+}
+const UNKNOWN_REQ = "__ptk_unknown__"
+const DAST_COUNTERS = createEmptyCounters()
+const DAST_REQUEST_COUNTERS = new Map()
+let requestFilterDirty = false
 const decoder = new ptk_decoder()
 const DAST_SEVERITY_ORDER = {
     critical: 0,
@@ -16,6 +40,7 @@ const DAST_SEVERITY_ORDER = {
     low: 3,
     info: 4
 }
+const DAST_BUCKET_ORDER = ['critical', 'high', 'medium', 'low', 'info', 'nonvuln']
 
 function formatDastSeverityLabel(value) {
     if (!value) return 'info'
@@ -26,6 +51,198 @@ function formatDastSeverityDisplay(value) {
     const normalized = formatDastSeverityLabel(value)
     return normalized.charAt(0).toUpperCase() + normalized.slice(1)
 }
+
+function createSeverityCounters() {
+    return {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        info: 0
+    }
+}
+
+function createEmptyCounters() {
+    return {
+        total: 0,
+        vuln: 0,
+        nonvuln: 0,
+        s4xx: 0,
+        s5xx: 0,
+        vuln4xx: 0,
+        vuln5xx: 0,
+        severity: createSeverityCounters(),
+        severity4xx: createSeverityCounters(),
+        severity5xx: createSeverityCounters()
+    }
+}
+
+function resetDastCounters() {
+    const empty = createEmptyCounters()
+    Object.keys(empty).forEach((key) => {
+        if (typeof empty[key] === 'object') {
+            Object.assign(DAST_COUNTERS[key], empty[key])
+        } else {
+            DAST_COUNTERS[key] = empty[key]
+        }
+    })
+    DAST_REQUEST_COUNTERS.clear()
+}
+
+function normalizeSeverityKey(value) {
+    if (!value) return 'info'
+    let normalized = String(value || '').toLowerCase()
+    if (normalized === 'informational') {
+        normalized = 'info'
+    }
+    return Object.prototype.hasOwnProperty.call(DAST_COUNTERS.severity, normalized)
+        ? normalized
+        : 'info'
+}
+
+function getAttackBucket(meta) {
+    if (!meta?.isVuln) {
+        return 'nonvuln'
+    }
+    return normalizeSeverityKey(meta.severity)
+}
+
+function buildBucketContainerHtml() {
+    return DAST_BUCKET_ORDER
+        .map((bucket) => `<div class="dast_bucket" data-bucket="${bucket}"></div>`)
+        .join('')
+}
+
+function ensureAttackBuckets() {
+    const $container = $("#attacks_info")
+    if ($container.find('.dast_bucket').length) {
+        return
+    }
+    $container.html(buildBucketContainerHtml())
+}
+
+function appendAttackToBucket(attackHtml, meta) {
+    if (!attackHtml) return
+    ensureAttackBuckets()
+    const bucket = getAttackBucket(meta)
+    const selector = `.dast_bucket[data-bucket="${bucket}"]`
+    const $bucket = $("#attacks_info").find(selector)
+    $bucket.addClass('has-items')
+    $bucket.append(attackHtml)
+}
+
+function normalizeRequestId(value) {
+    if (value === null || value === undefined || value === '') {
+        return UNKNOWN_REQ
+    }
+    return String(value)
+}
+
+function getRequestCounters(requestId) {
+    const key = normalizeRequestId(requestId)
+    if (!DAST_REQUEST_COUNTERS.has(key)) {
+        DAST_REQUEST_COUNTERS.set(key, createEmptyCounters())
+    }
+    return DAST_REQUEST_COUNTERS.get(key)
+}
+
+function applyCountersUpdate(target, meta) {
+    if (!target || !meta) return
+    target.total += 1
+    if (meta.is4xx) {
+        target.s4xx += 1
+    }
+    if (meta.is5xx) {
+        target.s5xx += 1
+    }
+    if (meta.isVuln) {
+        target.vuln += 1
+        const severityKey = normalizeSeverityKey(meta.severity)
+        target.severity[severityKey] += 1
+        if (meta.is4xx) {
+            target.vuln4xx += 1
+            target.severity4xx[severityKey] += 1
+        } else if (meta.is5xx) {
+            target.vuln5xx += 1
+            target.severity5xx[severityKey] += 1
+        }
+    } else {
+        target.nonvuln += 1
+    }
+}
+
+function updateDastCountersFromMeta(meta, requestId) {
+    // Counters are O(1) per insert to keep stats fast without DOM scans.
+    applyCountersUpdate(DAST_COUNTERS, meta)
+    applyCountersUpdate(getRequestCounters(requestId), meta)
+}
+
+function getBaseCounters() {
+    if (attackFilterState.requestId) {
+        return DAST_REQUEST_COUNTERS.get(normalizeRequestId(attackFilterState.requestId)) || createEmptyCounters()
+    }
+    return DAST_COUNTERS
+}
+
+function renderStatsFromCounters() {
+    const base = getBaseCounters()
+    let attacksCount = base.total
+    let findingsCount = base.vuln
+    let severity = base.severity
+    const useTotalForRequest = !!attackFilterState.requestId
+    if (attackFilterState.scope === 'vuln') {
+        attacksCount = base.total
+        findingsCount = base.vuln
+        severity = base.severity
+    } else if (attackFilterState.scope === '400') {
+        attacksCount = base.s4xx
+        findingsCount = base.vuln4xx
+        severity = base.severity4xx
+    } else if (attackFilterState.scope === '500') {
+        attacksCount = base.s5xx
+        findingsCount = base.vuln5xx
+        severity = base.severity5xx
+    }
+    rutils.bindStats({
+        attacksCount,
+        findingsCount,
+        critical: severity.critical,
+        high: severity.high,
+        medium: severity.medium,
+        low: severity.low,
+        info: severity.info
+    }, 'dast')
+}
+
+function escAttrValue(value) {
+    return String(value)
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/[\n\r\t\f\v]/g, " ")
+}
+
+function getRequestFilterStyleEl() {
+    let styleEl = document.getElementById('ptkRequestFilterStyle')
+    if (!styleEl) {
+        styleEl = document.createElement('style')
+        styleEl.id = 'ptkRequestFilterStyle'
+        document.head.appendChild(styleEl)
+    }
+    return styleEl
+}
+
+function updateRequestFilterStyle(requestId) {
+    const styleEl = getRequestFilterStyleEl()
+    if (!requestId) {
+        styleEl.textContent = ''
+        return
+    }
+    // CSS-only request filtering avoids O(N) hide/show on large lists.
+    const raw = String(requestId)
+    const escaped = (window.CSS && typeof CSS.escape === 'function') ? CSS.escape(raw) : escAttrValue(raw)
+    styleEl.textContent = `#attacks_info[data-request="${escaped}"] .attack_info[data-request-id="${escaped}"] { display:block; }`
+}
+
 
 
 jQuery(function () {
@@ -302,7 +519,12 @@ jQuery(function () {
                         last = group
                     }
                 })
-            }
+            },
+
+            scrollY: '100%',   // or a px value like '360px'
+            scrollCollapse: true,
+            paging: false
+
         }
         bindTable('#tbl_scans', params)
     }
@@ -466,7 +688,13 @@ jQuery(function () {
             $('#maxRequestsPerSecond').val(result.settings.maxRequestsPerSecond)
             $('#concurrency').val(result.settings.concurrency)
             $('#dast-scan-strategy').val(result.settings.dastScanStrategy || 'SMART')
+            $('#dast-scan-policy').val(result.settings.dastScanPolicy || 'ACTIVE')
             setRunCveState(false)
+            window._ptkDastReloadWarningClosed = false
+            rutils.pingContentScript(result.activeTab.tabId, { timeoutMs: 700 }).then((ready) => {
+                if (window._ptkDastReloadWarningClosed) return
+                $('#ptk_scan_reload_warning').toggle(!ready)
+            })
 
             $('#run_scan_dlg')
                 .modal({
@@ -476,9 +704,14 @@ jQuery(function () {
                             maxRequestsPerSecond: $('#maxRequestsPerSecond').val(),
                             concurrency: $('#concurrency').val(),
                             scanStrategy: $('#dast-scan-strategy').val() || 'SMART',
+                            dastScanPolicy: $('#dast-scan-policy').val() || 'ACTIVE',
                             runCve: isRunCveEnabled()
                         }
                         controller.runBackroungScan(result.activeTab.tabId, h, $('#scan_domains').val(), settings).then(function (result) {
+                            resetDastRenderState()
+                            DAST_RENDER.scanning = true
+                            startIdleChecker()
+                            updateLiveModeNotice()
                             $("#request_info").html("")
                             $("#attacks_info").html("")
                             triggerDastStatsEvent(result.scanResult)
@@ -491,7 +724,6 @@ jQuery(function () {
                 .popup({
                     inline: true,
                     hoverable: true,
-                    position: 'bottom left',
                     delay: {
                         show: 300,
                         hide: 800
@@ -502,8 +734,19 @@ jQuery(function () {
         return false
     })
 
+    $(document).on("click", "#ptk_scan_reload_warning_close_dast", function () {
+        window._ptkDastReloadWarningClosed = true
+        $('#ptk_scan_reload_warning').hide()
+    })
+
     $(document).on("click", ".stop_scan_runtime", function () {
         controller.stopBackroungScan().then(function (result) {
+            DAST_RENDER.scanning = false
+            if (DAST_RENDER.idleCheckTimer) {
+                clearInterval(DAST_RENDER.idleCheckTimer)
+                DAST_RENDER.idleCheckTimer = null
+            }
+            updateLiveModeNotice()
             changeView(result)
             bindScanResult(result)
         })
@@ -554,9 +797,9 @@ jQuery(function () {
     })
 
     $('.export_scan_btn').on('click', function () {
-        controller.init().then(function (result) {
-            if (hasRenderableScanData(result.scanResult)) {
-                let blob = new Blob([JSON.stringify(result.scanResult)], { type: 'text/plain' })
+        controller.exportScanResult().then(function (scanResult) {
+            if (scanResult && hasRenderableScanData(scanResult)) {
+                let blob = new Blob([JSON.stringify(scanResult)], { type: 'text/plain' })
                 let fName = "PTK_DAST_scan.json"
 
                 let downloadLink = document.createElement("a")
@@ -564,7 +807,11 @@ jQuery(function () {
                 downloadLink.innerHTML = "Download File"
                 downloadLink.href = window.URL.createObjectURL(blob)
                 downloadLink.click()
+            } else {
+                showResultModal("Error", "Nothing to export yet.")
             }
+        }).catch(err => {
+            showResultModal("Error", err?.message || "Unable to export scan")
         })
     })
 
@@ -672,87 +919,38 @@ jQuery(function () {
     })
 
 
-    const attackFilterState = {
-        scope: 'all',
-        requestId: null
-    }
-
-    const scopeFilters = {
-        all: function ($subset) {
-            $subset.show()
-            return $subset
-        },
-        vuln: function ($subset) {
-            const $visible = $subset.not('.nonvuln')
-            $visible.show()
-            return $visible
-        },
-        500: function ($subset) {
-            const $visible = $subset.filter('.5xx_status')
-            $visible.show()
-            return $visible
-        },
-        400: function ($subset) {
-            const $visible = $subset.filter('.4xx_status')
-            $visible.show()
-            return $visible
-        }
-    }
-
-    function collectStats($collection) {
-        const successItems = $collection.filter('.success')
-        const countBySeverity = (target) => successItems.filter(function () {
-            const attr = ($(this).attr('data-severity') || '').toLowerCase()
-            if (attr === target) return true
-            const label = target.charAt(0).toUpperCase() + target.slice(1)
-            return $(this).hasClass(label)
-        }).length
-        return {
-            attacksCount: $collection.length,
-            vulnsCount: successItems.length,
-            critical: countBySeverity('critical'),
-            high: countBySeverity('high'),
-            medium: countBySeverity('medium'),
-            low: countBySeverity('low'),
-            info: countBySeverity('info')
-        }
-    }
-
     function applyAttackFilters() {
-        const $all = $('.attack_info')
-        if (!$all.length) return
-        $all.hide()
-        const $requestSubset = attackFilterState.requestId ? $all.filter('.' + attackFilterState.requestId) : $all
-        const totalStats = collectStats($requestSubset)
-        const handler = scopeFilters[attackFilterState.scope] || scopeFilters.all
-        const $visible = handler($requestSubset)
-        const filteredStats = collectStats($visible)
-        const showFilteredStats =
-            attackFilterState.scope === '400' ||
-            attackFilterState.scope === '500'
-        const statsToDisplay = showFilteredStats ? filteredStats : totalStats
-        rutils.bindStats({
-            attacksCount: statsToDisplay.attacksCount,
-            vulnsCount: statsToDisplay.vulnsCount,
-            critical: statsToDisplay.critical,
-            high: statsToDisplay.high,
-            medium: statsToDisplay.medium,
-            low: statsToDisplay.low,
-            info: statsToDisplay.info
-        }, 'dast')
+        const requestId = attackFilterState.requestId
+        if (requestId) {
+            $("#attacks_info").attr("data-request", requestId)
+        } else {
+            $("#attacks_info").removeAttr("data-request")
+        }
+        $("#attacks_info").attr("data-scope", attackFilterState.scope)
+        // CSS-only filtering avoids full DOM hide/show on large scans.
+        updateRequestFilterStyle(requestId)
+        renderStatsFromCounters()
     }
+
 
     function setScopeFilter(scope) {
-        attackFilterState.scope = scope in scopeFilters ? scope : 'all'
+        const allowedScopes = new Set(['all', 'vuln', '400', '500'])
+        attackFilterState.scope = allowedScopes.has(scope) ? scope : 'all'
         $('[id^="filter_"]').removeClass('active primary')
         $('#filter_' + attackFilterState.scope).addClass('active primary')
         applyAttackFilters()
     }
 
     function setRequestFilter(requestId) {
-        attackFilterState.requestId = requestId
-        updateRequestFilterUI()
+        attackFilterState.requestId = requestId || null
+        requestFilterDirty = true
         applyAttackFilters()
+        if (window.ptkUpdateRequestFilterUI) {
+            const applied = window.ptkUpdateRequestFilterUI()
+            if (applied) {
+                requestFilterDirty = false
+            }
+        }
     }
 
     function updateRequestFilterUI() {
@@ -760,19 +958,36 @@ jQuery(function () {
         const $headers = $('#request_info .title.short_message_text')
         if (!$headers.length) {
             attackFilterState.requestId = null
-            return
+            updateRequestFilterStyle(null)
+            $("#attacks_info").removeAttr("data-request")
+            renderStatsFromCounters()
+            updateRequestFilterUI.lastHighlightedId = null
+            return true
         }
-        let found = false
-        $headers.each(function () {
-            const headerId = $(this).attr('data-request-id')
-            const matches = current != null && headerId === String(current)
-            if (matches) found = true
-            $(this).toggleClass('active', !!matches)
-            $(this).find('.filter.icon').toggleClass('primary', !!matches)
-        })
-        if (current != null && !found) {
-            attackFilterState.requestId = null
+        const currentId = current != null ? String(current) : null
+        const prevId = updateRequestFilterUI.lastHighlightedId || null
+        if (prevId && prevId !== currentId) {
+            const prevEscaped = (window.CSS && typeof CSS.escape === 'function') ? CSS.escape(prevId) : escAttrValue(prevId)
+            const $prev = $headers.filter(`[data-request-id="${prevEscaped}"]`)
+            $prev.toggleClass('active', false)
+            $prev.find('.filter.icon').toggleClass('primary', false)
         }
+        if (!currentId) {
+            updateRequestFilterUI.lastHighlightedId = null
+            return true
+        }
+        if (currentId) {
+            const currEscaped = (window.CSS && typeof CSS.escape === 'function') ? CSS.escape(currentId) : escAttrValue(currentId)
+            const $current = $headers.filter(`[data-request-id="${currEscaped}"]`)
+            if ($current.length) {
+                $current.toggleClass('active', true)
+                $current.find('.filter.icon').toggleClass('primary', true)
+                updateRequestFilterUI.lastHighlightedId = currentId
+                return true
+            }
+        }
+        updateRequestFilterUI.lastHighlightedId = null
+        return false
     }
 
     $('[id^="filter_"]').on("click", function () {
@@ -783,14 +998,37 @@ jQuery(function () {
     //$('#filter_all').addClass('active')
 
 
-    $(document).on("click", ".attack_details", function () {
+    function hasRawPayload(original) {
+        return !!(original?.request?.raw || original?.response?.body)
+    }
+
+    $(document).on("click", ".attack_details", async function () {
         $('.metadata .item').tab()
-        let requestId = $(this).attr("data-requestId")
-        let attackId = $(this).attr("data-index")
+        const requestId = $(this).attr("data-requestId")
+        const attackId = $(this).attr("data-index")
         const requestModel = findRequestModel(requestId)
-        const attack = findAttackModel(requestModel, attackId)
-        if (!attack || !requestModel) return
-        const original = requestModel.original || controller?.scanResult?.scanResult?.items?.[requestId]?.original
+        if (!requestModel) return
+        let attack = findAttackModel(requestModel, attackId)
+        if (!attack) return
+        let original = requestModel.original || controller?.scanResult?.scanResult?.items?.[requestId]?.original
+        if (!hasRawPayload(original)) {
+            try {
+                const snapshot = await controller.getRequestSnapshot(requestId, attackId)
+                if (snapshot?.original) {
+                    requestModel.original = snapshot.original
+                    original = snapshot.original
+                }
+                if (snapshot?.attack && Array.isArray(requestModel.attacks)) {
+                    const idx = requestModel.attacks.findIndex(item => String(item?.id) === String(attackId))
+                    if (idx >= 0) {
+                        requestModel.attacks[idx] = Object.assign({}, requestModel.attacks[idx], snapshot.attack)
+                        attack = requestModel.attacks[idx]
+                    }
+                }
+            } catch (_) {
+                // fall back to existing data
+            }
+        }
         const lookup = controller._dastFindingLookup || buildFindingLookup(controller?.scanViewModel?.findings || [])
         const enrichedAttack = attachFindingMetadataToAttack(attack, lookup)
         rutils.bindAttackDetails_DAST($(this), enrichedAttack, original)
@@ -801,7 +1039,7 @@ jQuery(function () {
     $(document).on("bind_stats", function (e, scanResult) {
         if (scanResult.stats) {
             rutils.bindStats(scanResult.stats, 'dast')
-            if ((scanResult.stats.vulnsCount || scanResult.stats.findingsCount || 0) > 0) {
+            if ((scanResult.stats.findingsCount || 0) > 0) {
                 $('#filter_vuln').trigger("click")
             }
         }
@@ -819,6 +1057,12 @@ jQuery(function () {
 
     controller.init().then(function (result) {
         changeView(result)
+        DAST_RENDER.scanning = !!result.isScanRunning
+        if (DAST_RENDER.scanning) {
+            DAST_RENDER.legacyBound = false
+            startIdleChecker()
+        }
+        updateLiveModeNotice()
         if (hasRenderableScanData(result.scanResult)) {
             bindScanResult(result)
         } else if (Array.isArray(result?.default_modules) && result.default_modules.length) {
@@ -829,7 +1073,9 @@ jQuery(function () {
     })
     $('.ui.accordion').accordion({
         onOpen: function () {
-            const index = $(this).find('input[name="requestId"]').val()
+            const $content = $(this)
+            const index = $content.find('input[name="requestId"]').val()
+            loadRequestRawForContent($content, index)
             setRequestFilter(index)
         },
         onClose: function () {
@@ -848,16 +1094,27 @@ function filterByRequestId(requestId) {
     }
 }
 
+function setDastPageLoader(show) {
+    const $loader = $('#dast_page_loader')
+    if (!$loader.length) return
+    $loader.toggle(!!show)
+}
+
 function showWelcomeForm() {
+    setDastPageLoader(false)
+    $('#main').hide()
     $('#welcome_message').show()
     $('#run_scan_bg_control').show()
 }
 
 function hideWelcomeForm() {
     $('#welcome_message').hide()
+    $('#main').show()
 }
 
 function showRunningForm(result) {
+    setDastPageLoader(false)
+    $('#main').show()
     $('#scanning_url').text(result.scanResult.host)
     $('.scan_info').show()
     $('#stop_scan_bg_control').show()
@@ -870,6 +1127,8 @@ function hideRunningForm() {
 }
 
 function showScanForm(result) {
+    setDastPageLoader(false)
+    $('#main').show()
     $('#run_scan_bg_control').show()
 }
 
@@ -880,6 +1139,12 @@ function hideScanForm() {
 
 function changeView(result) {
     $('#init_loader').removeClass('active')
+    if (!result || typeof result !== 'object') {
+        hideRunningForm()
+        hideScanForm()
+        showWelcomeForm()
+        return
+    }
     if (result.isScanRunning) {
         hideWelcomeForm()
         hideScanForm()
@@ -899,9 +1164,12 @@ function changeView(result) {
 
 function cleanScanResult() {
     $("#attacks_info").html("")
+    $("#attacks_info").attr("data-scope", "all")
+    resetDastCounters()
+    ensureAttackBuckets()
     rutils.bindStats({
         attacksCount: 0,
-        vulnsCount: 0,
+        findingsCount: 0,
         critical: 0,
         high: 0,
         medium: 0,
@@ -988,9 +1256,15 @@ function triggerDastStatsEvent(rawScanResult, viewModel) {
 function bindScanResult(result) {
     if (!result.scanResult) return
     const raw = result.scanResult || {}
-    const vm = normalizeScanResult(raw)
+    const vm = raw.__normalized ? raw : normalizeScanResult(raw)
     controller.scanResult = result
     controller.scanViewModel = vm
+    DAST_RENDER.queue = []
+    if (DAST_RENDER.timer) {
+        clearTimeout(DAST_RENDER.timer)
+        DAST_RENDER.timer = null
+    }
+    seedRenderedFromViewModel(vm)
     $("#progress_message").hide()
     $('.generate_report').show()
     $('.save_scan').show()
@@ -1002,27 +1276,60 @@ function bindScanResult(result) {
     const findingLookup = buildFindingLookup(findings)
     controller._dastFindingLookup = findingLookup
     const requests = Array.isArray(vm.requests) ? vm.requests : []
+    const requestMarkup = []
+    const bucketMarkup = {
+        critical: [],
+        high: [],
+        medium: [],
+        low: [],
+        info: [],
+        nonvuln: []
+    }
+    resetDastCounters()
     requests.forEach((request, index) => {
         const requestKey = String(request.id ?? `req-${index}`)
         const original = request.original && request.original.request ? request.original : request.original
         if (original && original.request) {
-            $("#request_info").append(bindRequest(original, requestKey))
+            requestMarkup.push(bindRequest(original, requestKey))
         }
         const attacks = Array.isArray(request.attacks) ? request.attacks : []
         attacks.forEach((attack, attackIdx) => {
             const attackKey = String(attack.id ?? `${requestKey}-${attackIdx}`)
             const enrichedAttack = attachFindingMetadataToAttack(attack, findingLookup)
-            $("#attacks_info").append(rutils.bindAttack(enrichedAttack, original, attackKey, requestKey))
+            const meta = rutils.getMiscMeta(enrichedAttack)
+            updateDastCountersFromMeta(meta, requestKey)
+            const attackHtml = rutils.bindAttack(enrichedAttack, original, attackKey, requestKey)
+            const bucket = getAttackBucket(meta)
+            bucketMarkup[bucket].push(attackHtml)
         })
     })
+    $("#request_info").html(requestMarkup.join(''))
+    $("#attacks_info").html([
+        `<div class="dast_bucket${bucketMarkup.critical.length ? ' has-items' : ''}" data-bucket="critical">${bucketMarkup.critical.join('')}</div>`,
+        `<div class="dast_bucket${bucketMarkup.high.length ? ' has-items' : ''}" data-bucket="high">${bucketMarkup.high.join('')}</div>`,
+        `<div class="dast_bucket${bucketMarkup.medium.length ? ' has-items' : ''}" data-bucket="medium">${bucketMarkup.medium.join('')}</div>`,
+        `<div class="dast_bucket${bucketMarkup.low.length ? ' has-items' : ''}" data-bucket="low">${bucketMarkup.low.join('')}</div>`,
+        `<div class="dast_bucket${bucketMarkup.info.length ? ' has-items' : ''}" data-bucket="info">${bucketMarkup.info.join('')}</div>`,
+        `<div class="dast_bucket${bucketMarkup.nonvuln.length ? ' has-items' : ''}" data-bucket="nonvuln">${bucketMarkup.nonvuln.join('')}</div>`
+    ].join(''))
+    $("#attacks_info").attr("data-scope", attackFilterState.scope)
+    updateRequestFilterStyle(attackFilterState.requestId)
 
-    if (window.ptkUpdateRequestFilterUI) {
-        window.ptkUpdateRequestFilterUI()
+    const deferWork = () => {
+        if (window.ptkUpdateRequestFilterUI) {
+            window.ptkUpdateRequestFilterUI()
+        }
+        renderStatsFromCounters()
+        DAST_RENDER.idleSorted = true
+        triggerDastStatsEvent(raw, vm)
+        if (window.ptkApplyAttackFilters) {
+            window.ptkApplyAttackFilters()
+        }
     }
-    rutils.sortAttacks()
-    triggerDastStatsEvent(raw, vm)
-    if (window.ptkApplyAttackFilters) {
-        window.ptkApplyAttackFilters()
+    if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(deferWork)
+    } else {
+        setTimeout(deferWork, 0)
     }
 }
 
@@ -1069,10 +1376,242 @@ function bindRequest(info, requestId) {
                
                 <div class="content">
                 <input type="hidden" name="requestId" value="${requestId}" />
-                <textarea class="ui medium input" style="width:100%; height:200px; border: solid 1px #cecece; padding: 12px;">${info.request.raw}</textarea></div>
+                <textarea class="ui medium input" data-request-raw="1" data-loaded="0" data-placeholder="Open to load request" placeholder="Open to load request" style="width:100%; height:200px; border: solid 1px #cecece; padding: 12px;"></textarea></div>
                 </div>
                 `
     return item
+}
+
+async function loadRequestRawForContent($content, requestId) {
+    if (!requestId) return
+    const $textarea = $content.find('textarea[data-request-raw="1"]')
+    if (!$textarea.length) return
+    if ($textarea.attr('data-loaded') === '1' || $textarea.attr('data-loading') === '1') return
+    // Lazy-load raw requests to avoid large upfront DOM payloads.
+    $textarea.attr('data-loading', '1')
+    const placeholder = $textarea.attr('data-placeholder') || 'Open to load request'
+    $textarea.attr('placeholder', 'Loading request...')
+    let raw = ''
+    const requestModel = findRequestModel(requestId)
+    raw = requestModel?.original?.request?.raw || ''
+    if (!raw) {
+        try {
+            const snapshot = await controller.getRequestSnapshot(requestId)
+            raw = snapshot?.original?.request?.raw || ''
+            if (snapshot?.original && requestModel) {
+                requestModel.original = snapshot.original
+            }
+        } catch (_) {
+            raw = ''
+        }
+    }
+    if (raw) {
+        $textarea.val(raw)
+        $textarea.attr('data-loaded', '1')
+    }
+    $textarea.attr('placeholder', placeholder)
+    $textarea.removeAttr('data-loading')
+}
+
+function buildRequestCardHtml(original, requestId) {
+    if (!original || !original.request) return ''
+    return bindRequest(original, requestId)
+}
+
+function buildAttackCardHtml(attack, original, attackId, requestId, lookup) {
+    const enriched = attachFindingMetadataToAttack(attack, lookup)
+    return rutils.bindAttack(enriched, original, attackId, requestId)
+}
+
+function seedRenderedFromViewModel(viewModel) {
+    DAST_RENDER.renderedRequestIds.clear()
+    DAST_RENDER.renderedAttackIds.clear()
+    const requests = Array.isArray(viewModel?.requests) ? viewModel.requests : []
+    requests.forEach(request => {
+        if (request?.id) {
+            DAST_RENDER.renderedRequestIds.add(String(request.id))
+        }
+        const attacks = Array.isArray(request?.attacks) ? request.attacks : []
+        attacks.forEach(attack => {
+            if (attack?.id) {
+                DAST_RENDER.renderedAttackIds.add(String(attack.id))
+            }
+        })
+    })
+}
+
+function updateLiveModeNotice() {
+    const $container = $("#progress_message .ui.small.message")
+    if (!$container.length) return
+    const noticeId = "dast_live_notice"
+    const shouldShow = DAST_RENDER.scanning
+    const existing = document.getElementById(noticeId)
+    if (shouldShow && !existing) {
+        $container.append(`<div id="${noticeId}" style="margin-top:4px; font-size: 12px;">Live mode: ordering deferred until scan completes.</div>`)
+    } else if (!shouldShow && existing) {
+        existing.remove()
+    }
+}
+
+function resetDastRenderState() {
+    DAST_RENDER.queue = []
+    if (DAST_RENDER.timer) {
+        clearTimeout(DAST_RENDER.timer)
+        DAST_RENDER.timer = null
+    }
+    if (DAST_RENDER.progressTimer) {
+        clearTimeout(DAST_RENDER.progressTimer)
+        DAST_RENDER.progressTimer = null
+    }
+    DAST_RENDER.renderedRequestIds.clear()
+    DAST_RENDER.renderedAttackIds.clear()
+    DAST_RENDER.legacyBound = false
+    DAST_RENDER.progressName = ''
+    DAST_RENDER.lastActivityAt = 0
+    DAST_RENDER.idleSorted = false
+    resetDastCounters()
+    requestFilterDirty = false
+    if (DAST_RENDER.idleCheckTimer) {
+        clearInterval(DAST_RENDER.idleCheckTimer)
+        DAST_RENDER.idleCheckTimer = null
+    }
+}
+
+function scheduleProgressUpdate(name) {
+    if (name) DAST_RENDER.progressName = name
+    DAST_RENDER.lastActivityAt = Date.now()
+    if (DAST_RENDER.progressTimer) return
+    DAST_RENDER.progressTimer = setTimeout(() => {
+        DAST_RENDER.progressTimer = null
+        if (DAST_RENDER.progressName) {
+            $("#progress_attack_name").text(DAST_RENDER.progressName)
+            $("#progress_message").show()
+        }
+    }, DAST_RENDER.progressFlushMs)
+}
+
+function startIdleChecker() {
+    if (DAST_RENDER.idleCheckTimer) return
+    DAST_RENDER.idleCheckTimer = setInterval(() => {
+        if (!DAST_RENDER.scanning) return
+        const last = DAST_RENDER.lastActivityAt || 0
+        if (Date.now() - last < 1500) return
+        scheduleProgressUpdate('No requests in queue')
+    }, 1000)
+}
+
+function countSnapshotAttacks(scanResult) {
+    const requests = Array.isArray(scanResult?.requests) ? scanResult.requests : []
+    if (!requests.length) return 0
+    return requests.reduce((sum, req) => sum + (Array.isArray(req?.attacks) ? req.attacks.length : 0), 0)
+}
+
+function ensureDastViewModel() {
+    if (!controller.scanViewModel) {
+        controller.scanViewModel = { requests: [], findings: [], stats: {} }
+    }
+    if (!Array.isArray(controller.scanViewModel.requests)) {
+        controller.scanViewModel.requests = []
+    }
+}
+
+function addDeltaToViewModel(delta) {
+    if (!delta) return
+    ensureDastViewModel()
+    const requestId = delta.requestId
+    if (!requestId) return
+    const requests = controller.scanViewModel.requests
+    let requestModel = requests.find(req => String(req?.id) === String(requestId))
+    if (!requestModel) {
+        requestModel = {
+            id: requestId,
+            original: delta.original ? { request: delta.original } : null,
+            attacks: []
+        }
+        requests.push(requestModel)
+    } else if (!requestModel.original && delta.original) {
+        requestModel.original = { request: delta.original }
+    }
+    if (Array.isArray(delta.attacks) && delta.attacks.length) {
+        delta.attacks.forEach(attack => {
+            if (!attack || !attack.id) return
+            const exists = requestModel.attacks.find(item => String(item.id) === String(attack.id))
+            if (!exists) {
+                requestModel.attacks.push(attack)
+            }
+        })
+    }
+}
+
+function enqueueDastDelta(delta) {
+    if (!delta) return
+    DAST_RENDER.queue.push(delta)
+    DAST_RENDER.scanning = true
+    DAST_RENDER.lastActivityAt = Date.now()
+    DAST_RENDER.idleSorted = false
+    startIdleChecker()
+    updateLiveModeNotice()
+    if (!DAST_RENDER.timer) {
+        DAST_RENDER.timer = setTimeout(flushDastQueue, DAST_RENDER.flushMs)
+    }
+}
+
+function flushDastQueue() {
+    if (DAST_RENDER.timer) {
+        clearTimeout(DAST_RENDER.timer)
+        DAST_RENDER.timer = null
+    }
+    if (!DAST_RENDER.queue.length) return
+
+    const deltas = DAST_RENDER.queue.splice(0, DAST_RENDER.queue.length)
+    const lookup = controller._dastFindingLookup || buildFindingLookup(controller?.scanViewModel?.findings || [])
+    const requestMarkup = []
+    const attackMarkup = []
+    let appendedRequests = false
+
+    deltas.forEach(delta => {
+        addDeltaToViewModel(delta)
+        const requestId = delta.requestId ? String(delta.requestId) : null
+        const original = delta.original ? { request: delta.original } : null
+        if (requestId && !DAST_RENDER.renderedRequestIds.has(requestId)) {
+            DAST_RENDER.renderedRequestIds.add(requestId)
+            const requestHtml = buildRequestCardHtml(original, requestId)
+            if (requestHtml) {
+                appendedRequests = true
+                requestMarkup.push(requestHtml)
+            }
+        }
+        const attacks = Array.isArray(delta.attacks) ? delta.attacks : []
+        attacks.forEach(attack => {
+            const attackId = attack?.id ? String(attack.id) : null
+            if (!attackId || DAST_RENDER.renderedAttackIds.has(attackId)) return
+            DAST_RENDER.renderedAttackIds.add(attackId)
+            const enrichedAttack = attachFindingMetadataToAttack(attack, lookup)
+            const meta = rutils.getMiscMeta(enrichedAttack)
+            updateDastCountersFromMeta(meta, requestId)
+            const attackHtml = rutils.bindAttack(enrichedAttack, original, attackId, requestId)
+            if (attackHtml) {
+                attackMarkup.push({ html: attackHtml, meta })
+            }
+        })
+    })
+
+    if (requestMarkup.length) {
+        $("#request_info").append(requestMarkup.join(''))
+    }
+    if (attackMarkup.length) {
+        ensureAttackBuckets()
+        attackMarkup.forEach(({ html, meta }) => {
+            appendAttackToBucket(html, meta)
+        })
+    }
+
+    if (window.ptkUpdateRequestFilterUI && (requestFilterDirty || appendedRequests)) {
+        window.ptkUpdateRequestFilterUI()
+        requestFilterDirty = false
+    }
+    // Avoid full DOM filtering/sorting on every flush to keep the popup responsive.
+    renderStatsFromCounters()
 }
 
 function bindAttackProgress(message) {
@@ -1088,14 +1627,53 @@ function bindAttackProgress(message) {
 ////////////////////////////////////
 browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     if (message.channel == "ptk_background2popup_rattacker") {
+        if (message.type == "dast_progress") {
+            scheduleProgressUpdate(message?.info?.name || 'Attack completed')
+        }
+        if (message.type == "dast_idle") {
+            scheduleProgressUpdate(message?.info?.message || 'No requests in queue')
+        }
+        if (message.type == "dast_plan_completed") {
+            enqueueDastDelta(message.delta)
+        }
+        if (message.type == "dast_scan_completed") {
+            DAST_RENDER.scanning = false
+            if (DAST_RENDER.idleCheckTimer) {
+                clearInterval(DAST_RENDER.idleCheckTimer)
+                DAST_RENDER.idleCheckTimer = null
+            }
+            updateLiveModeNotice()
+            flushDastQueue()
+            if (requestFilterDirty && window.ptkUpdateRequestFilterUI) {
+                window.ptkUpdateRequestFilterUI()
+                requestFilterDirty = false
+            }
+            if (message.scanResult) {
+                DAST_RENDER.legacyBound = true
+                bindScanResult({ scanResult: message.scanResult })
+            }
+            if (!DAST_RENDER.idleSorted) {
+                const runFinal = () => {
+                    renderStatsFromCounters()
+                    DAST_RENDER.idleSorted = true
+                }
+                // Defer expensive completion work to keep the popup responsive.
+                if (typeof requestIdleCallback === "function") {
+                    requestIdleCallback(runFinal, { timeout: 250 })
+                } else {
+                    setTimeout(runFinal, 0)
+                }
+            }
+            return
+        }
         if (message.type == "attack completed") {
             //$(document).trigger("bind_stats", message.scanResult)
             //$("#attacks_info").append(bindAttack(message.info))
             //bindScanResult(message)
-            bindAttackProgress(message)
+            scheduleProgressUpdate(message?.info?.name || 'Attack completed')
         }
         if (message.type == "all attacks completed") {
-            bindScanResult(message)
+            // Rely on delta pipeline; avoid one-time full bind to reduce UI churn.
         }
         if (message.type == "attack failed") {
             $('#scan_error_message').text(message.info)

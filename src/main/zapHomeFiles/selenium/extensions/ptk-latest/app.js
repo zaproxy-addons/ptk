@@ -24,6 +24,7 @@ import { ptk_sast } from "./ptk/background/sast.js"
 
 const worker = self
 worker.isFirefox = browser.runtime.getBrowserInfo ? true : false
+ 
 
 export class ptk_app {
     constructor(settings) {
@@ -31,6 +32,7 @@ export class ptk_app {
         this.settings = new ptk_settings(settings)
 
         browser.storage.local.get('pentestkit8_settings').then(function (result) {
+ 
             if (result.pentestkit8_settings) {
                 this.settings.mergeSettings(result.pentestkit8_settings)
                 if (this.updated) this.settings.release_note.show = true
@@ -92,16 +94,18 @@ export class ptk_app {
                 }
 
                 if (message.type == "release_note") {
-                    sendResponse({ show: this.settings.release_note.show })
+                    sendResponse && sendResponse({ show: this.settings.release_note.show })
                     return true
                 }
                 if (message.type == "release_note_read") {
-                    this.settings.updateSettings("release_note", {show:false})
+                    this.settings.updateSettings("release_note", { show: false })
+                    sendResponse && sendResponse({ ok: true })
                     return true
                 }
 
                 if (message.type == "ping") {
-                    return "pong"
+                    sendResponse && sendResponse("pong")
+                    return true
                 }
             }
         }.bind(this))
@@ -124,8 +128,8 @@ fetch(browser.runtime.getURL('ptk/settings.json'))
     .then(response => response.json())
     .then(settings => {
         worker.ptk_app = new ptk_app(settings)
+        
     })
-
-
-
-
+    .catch(err => {
+        
+    })

@@ -174,7 +174,7 @@ export class ptk_notifications {
         browser.notifications.create(
             'PTK_notification', {
             type: 'basic',
-            /*iconUrl: browser.runtime.getURL('browser/assets/images/icon.png'),*/
+            iconUrl: browser.runtime.getURL('ptk/browser/assets/images/icon.png'),
             title: title,
             message: message
         })
@@ -491,22 +491,31 @@ export class ptk_ruleManager {
             schema.request.headers.forEach((h) => {
                 headers.push({ "header": h.name, "operation": "set", "value": h.value })
             })
+            let requestDomain = null
+            try {
+                requestDomain = new URL(schema.request.url).hostname
+            } catch (_) {
+                requestDomain = null
+            }
+            let condition = {
+                "urlFilter": schema.request.url,
+                "resourceTypes": ["xmlhttprequest", "other"]
+            }
+            if (requestDomain) condition.requestDomains = [requestDomain]
+            if (chrome?.runtime?.id) condition.initiatorDomains = [chrome.runtime.id]
+
+            const rule = {
+                "id": parseInt(ruleId),
+                "priority": 1,
+                "action": {
+                    "type": "modifyHeaders",
+                    "requestHeaders": headers
+                },
+                "condition": condition
+            }
+
             await chrome.declarativeNetRequest.updateSessionRules({
-                addRules: [
-                    {
-                        "id": parseInt(ruleId),
-                        "priority": 1,
-                        "action": {
-                            "type": "modifyHeaders",
-                            "requestHeaders": headers
-                        },
-                        "condition": {
-                            "domains": [chrome.runtime.id],
-                            "urlFilter": schema.request.url,
-                            "resourceTypes": ["xmlhttprequest"]
-                        }
-                    },
-                ]
+                addRules: [rule]
             })
 
         }

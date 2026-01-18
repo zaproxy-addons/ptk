@@ -1,4 +1,9 @@
 
+if (typeof browser === 'undefined') {
+    // Extension context not available (e.g., page reload before injection)
+    return
+}
+
 if (!document.getElementById('ptk_recording_control') && !window.opener) {
 
     browser.storage.local.get([
@@ -214,9 +219,10 @@ if (!document.getElementById('ptk_recording_control') && !window.opener) {
         showMessage(msg)
 
         document.getElementById("ptk_recording_control_icon_stop").addEventListener('click', function (e) {
+            const isReplay = result.ptk_replay?.mode == 'replay'
             browser.runtime.sendMessage({
                 channel: "ptk_popup2background_recorder",
-                type: "stop_recording"
+                type: isReplay ? "stop_replay" : "stop_recording"
             }).catch(e => e)
         })
 
@@ -247,8 +253,10 @@ if (!document.getElementById('ptk_recording_control') && !window.opener) {
 
         function showMessage(text) {
             let el = document.getElementById('ptk_recording_message')
+            if (!el) return
             el.innerHTML = text
-            document.getElementById('ptk_recording_wrapper').scrollTop = document.getElementById('ptk_recording_wrapper').scrollHeight
+            const wrapper = document.getElementById('ptk_recording_wrapper')
+            if (wrapper) wrapper.scrollTop = wrapper.scrollHeight
         }
 
         function forceClosing() {
@@ -259,8 +267,23 @@ if (!document.getElementById('ptk_recording_control') && !window.opener) {
                 window.ptk_recording_interval = setInterval(function () {
 
                     var timer = document.getElementById('ptk_recording_timer')
-                    var val = parseInt(timer.innerText)
-                    timer.innerText = val - 1
+                    if (!timer) {
+                        clearInterval(window.ptk_recording_interval)
+                        return
+                    }
+                    var val = parseInt(timer.innerText, 10)
+                    if (!Number.isFinite(val)) val = 0
+                    val = val - 1
+                    if (val <= 0) {
+                        timer.innerText = 0
+                        clearInterval(window.ptk_recording_interval)
+                        browser.runtime.sendMessage({
+                            channel: "ptk_popup2background_recorder",
+                            type: "stop_replay"
+                        }).catch(e => e)
+                        return
+                    }
+                    timer.innerText = val
                 }, 1000)
                 window.ptk_recording_timer = setTimeout(function () {
                     browser.runtime.sendMessage({
@@ -274,10 +297,21 @@ if (!document.getElementById('ptk_recording_control') && !window.opener) {
         window.ptk_recording_timer = null
         window.ptk_recording_interval = null
 
-        browser.storage.onChanged.addListener(function (changes, namespace) {
-            if (changes['ptk_recording_log']) {
-                showMessage(changes['ptk_recording_log'].newValue)
+    browser.storage.onChanged.addListener(function (changes, namespace) {
+        if (changes['ptk_recording'] || changes['ptk_replay']) {
+            const wasRecording = changes['ptk_recording']?.oldValue?.mode === 'recording'
+            const wasReplaying = changes['ptk_replay']?.oldValue?.mode === 'replay'
+            if ((changes['ptk_recording'] && !changes['ptk_recording'].newValue) ||
+                (changes['ptk_replay'] && !changes['ptk_replay'].newValue)) {
+                const popup = document.getElementById('ptk_recording_control')
+                if (popup) popup.remove()
+                if (window.ptk_recording_timer) clearTimeout(window.ptk_recording_timer)
+                if (window.ptk_recording_interval) clearInterval(window.ptk_recording_interval)
             }
+        }
+        if (changes['ptk_recording_log']) {
+            showMessage(changes['ptk_recording_log'].newValue)
+        }
 
             if (changes['ptk_replay_step']) {
                 let changedValue = changes['ptk_replay_step'].newValue

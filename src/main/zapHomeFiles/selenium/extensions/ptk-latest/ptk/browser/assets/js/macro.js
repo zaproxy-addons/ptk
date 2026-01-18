@@ -4,7 +4,9 @@ import { ptk_controller_macro } from "../../../controller/macro.js"
 const controller = new ptk_controller_macro()
 
 jQuery(function () {
-    $('.menu .item').tab()
+    if ($('.menu .item[data-tab]').length) {
+        $('.menu .item').tab()
+    }
     let editor = CodeMirror.fromTextArea(document.getElementById('recording_output'), {
         lineNumbers: true, lineWrapping: true, mode: "application/xml", indentUnit: 3,
         scrollbarStyle: null, extraKeys: { "Ctrl-Y": function (cm) { cm.foldCode(cm.getCursor()) } },
@@ -20,6 +22,23 @@ jQuery(function () {
 
 
     let $form = $('#macro_form')
+
+    $form.form({
+        inline: true,
+        selector: {
+            field: 'input[name]:not(.search):not([type="reset"]):not([type="button"]):not([type="submit"]), textarea[name], select[name]'
+        },
+        fields: {
+            url: {
+                identifier: 'url',
+                rules: [{
+                    prompt: 'URL is required in the format http://example.com or https://120.0.0.1',
+                    type: 'regExp',
+                    value: /^((http|https):\/\/){1}(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])?(:+[0-9]+)?([\/\?]{1}.*)?$/i,
+                }]
+            }
+        }
+    })
 
     let waiting = true
     controller.init().then(function (result) {
@@ -45,7 +64,11 @@ jQuery(function () {
         $form.form('validate form')
         if ($form.form('is valid')) {
             try {
-                let url = new URL($form.form('get value', 'url'))
+                const rawUrl = $form.form('get value', 'url')
+                if (!rawUrl) {
+                    throw new Error('URL is required')
+                }
+                let url = new URL(rawUrl)
                 controller.start(this.attributes['data-value'].value == 'true', url.toString())
             } catch (e) {
                 $('#macro_error_message').text("Could start recording " + e.message)
@@ -87,20 +110,6 @@ jQuery(function () {
         // else {
         //     $("input[name='validate_regex']").prop('disabled', true)
         // }
-        $form.form({
-            inline: true,
-            fields: {
-                url: {
-                    identifier: 'url',
-                    rules: [{
-                        prompt: 'URL is required in the format http://example.com or https://120.0.0.1',
-                        type: 'regExp',
-                        value: /^((http|https):\/\/){1}(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])?(:+[0-9]+)?([\/\?]{1}.*)?$/i,
-                    }]
-                }
-            }
-        })
-
         if (!controller.recording?.items) {
             $('.content .segment').dimmer('show')
         } else {
@@ -256,23 +265,23 @@ jQuery(function () {
         reader.readAsText(files[0])
     })
 
-    // $('.macro_replay, .macro_replay_clean_cookie').on('click', function () {
-    //     try {
-    //         let [startUrl, events] = controller.import(editor.getValue())
-    //         if (startUrl && events.length > 0) {
-    //             let values = $form.form('get values')
-    //             controller.replay(this.attributes['data-value'].value == 'true', startUrl, events,
-    //                 (values['enable_regex'] == 'on') ? values['validate_regex'] : null
-    //             )
-    //         } else {
-    //             $('#macro_error_message').text("Recorded macro is empty. Export or copy and paste a macro to replay")
-    //             $('.mini.modal.error').modal('show')
-    //         }
-    //     } catch (e) {
-    //         $('#macro_error_message').text("Could not parse XML\n" + e.message)
-    //         $('.mini.modal.error').modal('show')
-    //     }
-    // })
+    $('.macro_replay, .macro_replay_clean_cookie').on('click', function () {
+        try {
+            let [startUrl, events] = controller.import(editor.getValue())
+            if (startUrl && events.length > 0) {
+                let values = $form.form('get values')
+                controller.replay(this.attributes['data-value'].value == 'true', startUrl, events,
+                    (values['enable_regex'] == 'on') ? values['validate_regex'] : null
+                )
+            } else {
+                $('#macro_error_message').text("Recorded macro is empty. Export or copy and paste a macro to replay")
+                $('.mini.modal.error').modal('show')
+            }
+        } catch (e) {
+            $('#macro_error_message').text("Could not parse XML\n" + e.message)
+            $('.mini.modal.error').modal('show')
+        }
+    })
 
     $('.macro_download').on('click', function () {
         try {

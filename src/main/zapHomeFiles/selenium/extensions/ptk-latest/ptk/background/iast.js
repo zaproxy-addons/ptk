@@ -1,19 +1,18 @@
 /* Author: Denis Podgurskii */
 import { ptk_utils, ptk_logger, ptk_queue, ptk_storage, ptk_ruleManager } from "../background/utils.js"
-import { createFindingFromIAST, getFindingFingerprint, mergeFinding } from "./iast/modules/reporting.js"
+import { createFindingFromIAST, getIastEvidencePayload } from "./iast/modules/reporting.js"
 import { loadRulepack } from "./common/moduleRegistry.js"
-import {
-    createScanResultEnvelope,
-    addFindingToGroup
-} from "./common/scanResults.js"
+import { scanResultStore } from "./scanResultStore.js"
 import {
     normalizeRulepack,
     normalizeSeverityValue,
     resolveEffectiveSeverity
 } from "./common/severity_utils.js"
+import buildExportScanResult from "./export/buildExportScanResult.js"
 
 const activeIastTabs = new Set()
 let iastModulesCache = null
+let iastScanStrategy = 'SMART'
 function mergeLinks(baseLinks, overrideLinks) {
     const result = Object.assign({}, baseLinks || {})
     if (overrideLinks && typeof overrideLinks === "object") {
@@ -26,6 +25,7 @@ function mergeLinks(baseLinks, overrideLinks) {
 
 function buildIastRuleIndex(rulepack) {
     iastRuleMetaIndex = new Map()
+    iastModuleMetaIndex = new Map()
     const modules = Array.isArray(rulepack?.modules) ? rulepack.modules : []
     modules.forEach((mod) => {
         const moduleMeta = mod?.metadata || {}
@@ -42,6 +42,18 @@ function buildIastRuleIndex(rulepack) {
             recommendation: moduleMeta.recommendation || null,
             links: moduleMeta.links || null
         }
+        iastModuleMetaIndex.set(base.moduleId, {
+            id: base.moduleId,
+            name: base.moduleName,
+            metadata: moduleMeta,
+            vulnId: base.vulnId,
+            category: base.category,
+            severity: base.severity,
+            links: base.links,
+            tags: base.tags,
+            description: base.description,
+            recommendation: base.recommendation
+        })
         const rules = Array.isArray(mod?.rules) ? mod.rules : []
         rules.forEach(rule => {
             const ruleMeta = rule?.metadata || {}
@@ -63,8 +75,12 @@ function buildIastRuleIndex(rulepack) {
                 description: ruleMeta.description || base.description || null,
                 recommendation: ruleMeta.recommendation || base.recommendation || null,
                 links: mergedLinks,
-                moduleMeta,
-                ruleMeta
+                moduleMeta: iastModuleMetaIndex.get(base.moduleId),
+                ruleMeta: {
+                    id: rule?.id || null,
+                    name: rule?.name || rule?.id || null,
+                    metadata: ruleMeta
+                }
             })
         })
     })
@@ -75,6 +91,12 @@ function getIastRuleMeta(ruleId) {
     return iastRuleMetaIndex.get(ruleId) || null
 }
 let iastRuleMetaIndex = new Map()
+let iastModuleMetaIndex = new Map()
+
+function getIastModuleMeta(moduleId) {
+    if (!moduleId) return null
+    return iastModuleMetaIndex.get(moduleId) || null
+}
 
 function getRuntime() {
     if (typeof chrome !== 'undefined' && chrome.runtime) return chrome
@@ -115,6 +137,7 @@ async function sendIastModulesToContent(tabId, attempt = 1) {
             {
                 channel: 'ptk_background_iast2content_modules',
                 iastModules: modules,
+                scanStrategy: iastScanStrategy
             },
             () => {
                 const err = rt.runtime.lastError
@@ -147,6 +170,11 @@ const SEVERITY_ORDER = {
     critical: 4
 }
 
+function isHttpUrl(url) {
+    if (!url) return false
+    return /^https?:\/\//i.test(String(url))
+}
+
 export class ptk_iast {
 
     constructor(settings) {
@@ -158,6 +186,13 @@ export class ptk_iast {
         this.maxHttpEvents = MAX_HTTP_EVENTS
         this.maxTrackedRequests = MAX_TRACKED_REQUESTS
         this.requestLookup = new Map()
+        this._requestLookupByUrl = new Map()
+        this._pagesByKey = new Map()
+        this._pagesByUrl = new Map()
+        this._pageFindingIds = new Map()
+        this._missingPageCounter = 0
+        this._persistTimer = null
+        this._persistDebounceMs = 1000
         this.resetScanResult()
         this.modulesCatalog = null
 
@@ -165,11 +200,11 @@ export class ptk_iast {
     }
 
     async init() {
-
         if (!this.isScanRunning) {
+            await loadIastModules()
             const stored = await ptk_storage.getItem(this.storageKey) || {}
             if (stored && ((stored.scanResult) || Object.keys(stored).length > 0)) {
-                this.normalizeScanResult(stored)
+                await this.normalizeScanResult(stored)
             }
         }
     }
@@ -178,8 +213,18 @@ export class ptk_iast {
         this.unregisterScript()
         this.detachDevtoolsDebugger()
         this.isScanRunning = false
+        if (this.currentScanId) {
+            scanResultStore.deleteScan(this.currentScanId)
+        }
         this.scanResult = this.getScanResultSchema()
+        this.currentScanId = this.scanResult?.scanId || null
         this.requestLookup = new Map()
+        this._requestLookupByUrl = new Map()
+        this._resetPageIndexes()
+        if (this._persistTimer) {
+            clearTimeout(this._persistTimer)
+            this._persistTimer = null
+        }
     }
 
     async getDefaultModules(rulepack = null) {
@@ -193,30 +238,48 @@ export class ptk_iast {
         }
     }
 
-    getScanResultSchema() {
-        const envelope = createScanResultEnvelope({
+    getScanResultSchema({ scanId = null, host = null, startedAt = null } = {}) {
+        return scanResultStore.createScan({
             engine: "IAST",
-            scanId: null,
-            host: null,
-            tabId: null,
-            startedAt: new Date().toISOString(),
-            settings: {}
+            scanId: scanId || ptk_utils.UUID(),
+            host,
+            startedAt: startedAt || new Date().toISOString(),
+            settings: {},
+            extraFields: {
+                httpEvents: [],
+                runtimeEvents: [],
+                requests: [],
+                pages: [],
+                files: []
+            }
         })
-        envelope.stats = { findingsCount: 0, high: 0, medium: 0, low: 0, info: 0 }
-        envelope.httpEvents = []
-        envelope.runtimeEvents = []
-        envelope.requests = []
-        envelope.pages = []
-        envelope.files = []
-        return this._normalizeEnvelope(envelope)
     }
 
     persistScanResult() {
-        const cloned = this._cloneForStorage(this.scanResult, { dropTabId: true }) || {}
+        const scanId = this.scanResult?.scanId || this.currentScanId
+        const source = scanId ? scanResultStore.exportScanResult(scanId) : this.scanResult
+        const cloned = this._cloneForStorage(source, { dropTabId: true }) || {}
         if (Array.isArray(cloned.rawFindings)) {
             delete cloned.rawFindings
         }
         ptk_storage.setItem(this.storageKey, cloned)
+    }
+
+    _schedulePersistScanResult() {
+        if (this._persistTimer) return
+        this._persistTimer = setTimeout(() => {
+            this._persistTimer = null
+            // Debounce storage writes to reduce MV2 overhead.
+            this.persistScanResult()
+        }, this._persistDebounceMs)
+    }
+
+    _flushPersistScanResult() {
+        if (this._persistTimer) {
+            clearTimeout(this._persistTimer)
+            this._persistTimer = null
+        }
+        this.persistScanResult()
     }
 
     _cloneForStorage(value, { dropTabId = false } = {}) {
@@ -232,7 +295,13 @@ export class ptk_iast {
     }
 
     _getPublicScanResult() {
-        return this._cloneForStorage(this.scanResult, { dropTabId: true })
+        const scanId = this.scanResult?.scanId || this.currentScanId
+        const exported = scanId ? scanResultStore.exportScanResult(scanId) : this.scanResult
+        const clone = this._cloneForStorage(exported, { dropTabId: true })
+        if (clone && typeof clone === "object") {
+            clone.__normalized = true
+        }
+        return clone
     }
 
     _extractPersistedData(raw) {
@@ -314,6 +383,7 @@ export class ptk_iast {
                 // ignore malformed URLs
             }
         }
+        if (!isHttpUrl(response.url)) return
 
         const evt = {
             type: "http",
@@ -363,58 +433,52 @@ export class ptk_iast {
                         })
                         this.addOrUpdateFinding(finding)
                     } catch (e) {
-                        console.warn('[PTK IAST DEBUG][background] createFindingFromIAST failed', e)
+                        console.warn('[PTK IAST][background] createFindingFromIAST failed', e)
                     }
                 } else {
-                    try { console.info('[PTK IAST DEBUG][background] finding ignored (no active scan or tab mismatch)') } catch (_) { }
+                    // Ignore findings when scan is not active or tab mismatches.
                 }
             }
         }
 
         if (message.channel === "ptk_content_iast2background_request_modules") {
             ;(async () => {
-                const modules = await loadIastModules()
-                if (!modules) {
-                    console.warn('[PTK IAST BG] No IAST modules available for request')
-                    sendResponse && sendResponse({ iastModules: null })
-                    return
+                try {
+                    const modules = await loadIastModules()
+                    if (!modules) {
+                        console.warn('[PTK IAST BG] No IAST modules available for request')
+                        sendResponse && sendResponse({ iastModules: null, scanStrategy: iastScanStrategy })
+                        return
+                    }
+                    const tabId = sender?.tab?.id
+                    //console.log('[PTK IAST BG] Content requested IAST modules for tab', tabId)
+                    sendResponse && sendResponse({ iastModules: modules, scanStrategy: iastScanStrategy })
+                } catch (err) {
+                    console.warn('[PTK IAST BG] Failed to load IAST modules', err)
+                    sendResponse && sendResponse({ iastModules: null, scanStrategy: iastScanStrategy, error: err?.message || String(err) })
                 }
-                const tabId = sender?.tab?.id
-                //console.log('[PTK IAST BG] Content requested IAST modules for tab', tabId)
-                sendResponse && sendResponse({ iastModules: modules })
             })()
             return true
         }
     }
 
-    updateScanResult({ persist = true } = {}) {
+    updateScanResult({ persist = true, immediate = false } = {}) {
         if (!this.scanResult) {
             this.scanResult = this.getScanResultSchema()
+            this.currentScanId = this.scanResult?.scanId || null
         }
-        if (!Array.isArray(this.scanResult.findings)) {
-            this.scanResult.findings = []
+        if (!this.scanResult.stats || typeof this.scanResult.stats !== "object") {
+            this.scanResult.stats = { findingsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 }
         }
-        this._rebuildGroupsFromFindings()
-        const findings = this.scanResult.findings
-        const stats = {
-            findingsCount: findings.length,
-            high: 0,
-            medium: 0,
-            low: 0,
-            info: 0
-        }
-        findings.forEach(finding => {
-            const severity = String(finding?.severity || "").toLowerCase()
-            if (severity === "high") stats.high++
-            else if (severity === "medium") stats.medium++
-            else if (severity === "low") stats.low++
-            else stats.info = (stats.info || 0) + 1
-        })
-        stats.vulnsCount = stats.findingsCount
-        this.scanResult.stats = stats
-        this.updatePagesFromFindings()
+        this.scanResult.stats.requestsCount = Array.isArray(this.scanResult.requests)
+            ? this.scanResult.requests.length
+            : 0
         if (persist) {
-            this.persistScanResult()
+            if (immediate) {
+                this._flushPersistScanResult()
+            } else {
+                this._schedulePersistScanResult()
+            }
         }
     }
 
@@ -466,30 +530,34 @@ export class ptk_iast {
             return Promise.reject(new Error("Wrong format or empty scan result"))
         }
         this.reset()
-        const payload = this._extractPersistedData(res)
-        this.scanResult = this._normalizeEnvelope(payload.scanResult || {})
-        if (Array.isArray(this.scanResult.findings) && this.scanResult.findings.length) {
-            this.scanResult.findings = this.scanResult.findings.map(item => this.prepareFindingMetadata(item))
-        } else {
-            this.scanResult.findings = []
-        }
-        this._ingestLegacyRawFindings(Array.isArray(payload.rawFindings) ? payload.rawFindings : [])
-        if (Array.isArray(this.scanResult.rawFindings) && this.scanResult.rawFindings.length) {
-            this._ingestLegacyRawFindings(this.scanResult.rawFindings)
-            delete this.scanResult.rawFindings
-        }
-        this.updateScanResult({ persist: true })
+        await loadIastModules()
+        await this.normalizeScanResult(res)
+        this.updateScanResult({ persist: true, immediate: true })
         const defaultModules = await this.getDefaultModules()
-        return Promise.resolve({
+        return {
             scanResult: this._getPublicScanResult(),
             isScanRunning: this.isScanRunning,
             activeTab: worker.ptk_app.proxy.activeTab,
             default_modules: defaultModules
-        })
+        }
+    }
+
+    async msg_export_scan_result(message) {
+        const scanId = this.scanResult?.scanId || this.currentScanId || null
+        if (!scanId) return null
+        try {
+            return buildExportScanResult(scanId, {
+                target: message?.target || "download",
+                scanResult: this.scanResult
+            })
+        } catch (err) {
+            console.error("[PTK IAST] Failed to export scan result", err)
+            throw err
+        }
     }
 
     msg_run_bg_scan(message) {
-        return this.runBackroungScan(message.tabId, message.host).then(async () => {
+        return this.runBackroungScan(message.tabId, message.host, message.scanStrategy).then(async () => {
             const defaultModules = await this.getDefaultModules()
             return { isScanRunning: this.isScanRunning, scanResult: this._getPublicScanResult(), default_modules: defaultModules }
         })
@@ -500,22 +568,36 @@ export class ptk_iast {
         return Promise.resolve({ scanResult: this._getPublicScanResult() })
     }
 
-    async runBackroungScan(tabId, host) {
+    async runBackroungScan(tabId, host, scanStrategy) {
+        if (this.isScanRunning) {
+            return false
+        }
         this.reset()
         this.isScanRunning = true
         this.scanningRequest = false
-        this.scanResult.scanId = ptk_utils.UUID()
+        browser.tabs.sendMessage(tabId, {
+            channel: "ptk_background_iast2content",
+            type: "clean iast result"
+        }).catch(() => { })
+        const scanId = ptk_utils.UUID()
+        const started = new Date().toISOString()
+        this.scanResult = this.getScanResultSchema({ scanId, host, startedAt: started })
         this.scanResult.tabId = tabId
         this.scanResult.host = host
-        const started = new Date().toISOString()
         this.scanResult.startedAt = started
         this.scanResult.finishedAt = null
+        this.scanResult.settings = Object.assign({}, this.scanResult.settings || {}, {
+            iastScanStrategy: scanStrategy || 'SMART'
+        })
+        iastScanStrategy = this.scanResult.settings.iastScanStrategy
+        this.currentScanId = scanId
         activeIastTabs.add(tabId)
         this.registerScript()
         this.addListeners()
         this.attachDevtoolsDebugger(tabId)
         await loadIastModules()
         await sendIastModulesToContent(tabId)
+        this.broadcastScanUpdate()
     }
 
     stopBackroungScan() {
@@ -529,14 +611,17 @@ export class ptk_iast {
         this.unregisterScript()
         this.removeListeners()
         this.detachDevtoolsDebugger()
-        if (this.scanResult) {
+        if (this.scanResult?.scanId) {
             const finished = new Date().toISOString()
+            scanResultStore.setFinished(this.scanResult.scanId, finished)
             this.scanResult.finishedAt = finished
         }
-        this.persistScanResult()
+        this._flushPersistScanResult()
+        this.broadcastScanUpdate()
     }
 
     recordHttpEvent(evt) {
+        if (!evt || !isHttpUrl(evt.url)) return
         if (!this.scanResult.httpEvents) {
             this.scanResult.httpEvents = []
         }
@@ -545,34 +630,80 @@ export class ptk_iast {
         if (this.scanResult.httpEvents.length > this.maxHttpEvents) {
             this.scanResult.httpEvents.shift()
         }
-        this.persistScanResult()
+        if (!this.scanResult.stats || typeof this.scanResult.stats !== "object") {
+            this.scanResult.stats = { findingsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 }
+        }
+        this.scanResult.stats.requestsCount = Array.isArray(this.scanResult.requests)
+            ? this.scanResult.requests.length
+            : 0
+        this._schedulePersistScanResult()
     }
 
     addOrUpdateFinding(finding) {
-        if (!finding) return
+        if (!finding || !this.scanResult?.scanId) return
         let prepared
         try {
             prepared = this.prepareFindingMetadata(finding)
         } catch (e) {
-            try { console.warn('[PTK IAST DEBUG][background] prepareFindingMetadata failed', e) } catch (_) { }
+            try { console.warn('[PTK IAST][background] prepareFindingMetadata failed', e) } catch (_) { }
             return
         }
-        this._upsertFinding(prepared)
+        if (!prepared) return
+        scanResultStore.upsertFinding({
+            scanId: this.scanResult.scanId,
+            engine: "IAST",
+            finding: prepared.finding,
+            moduleMeta: prepared.moduleMeta,
+            ruleMeta: prepared.ruleMeta
+        })
+        this._upsertPageFromFinding(prepared.finding)
         this.updateScanResult()
-        this.broadcastScanUpdate()
+        this.broadcastScanDelta(prepared.finding)
     }
 
-    normalizeScanResult(raw) {
+    async normalizeScanResult(raw) {
+        await loadIastModules()
         const payload = this._extractPersistedData(raw || {})
-        this.scanResult = this._normalizeEnvelope(payload.scanResult || {})
-        if (Array.isArray(this.scanResult.findings) && this.scanResult.findings.length) {
-            this.scanResult.findings = this.scanResult.findings.map(item => this.prepareFindingMetadata(item))
-        } else {
-            this.scanResult.findings = []
-        }
+        const source = payload.scanResult || {}
+        const scanId = source.scanId || ptk_utils.UUID()
+        this.scanResult = this.getScanResultSchema({
+            scanId,
+            host: source.host || null,
+            startedAt: source.startedAt || source.date || new Date().toISOString()
+        })
+        this.scanResult.tabId = source.tabId || null
+        this.scanResult.policyId = source.policyId || null
+        this.scanResult.settings = source.settings || {}
+        this.scanResult.httpEvents = Array.isArray(source.httpEvents) ? source.httpEvents : []
+        this.scanResult.runtimeEvents = Array.isArray(source.runtimeEvents) ? source.runtimeEvents : []
+        this.scanResult.requests = Array.isArray(source.requests) ? source.requests : []
+        this.scanResult.pages = Array.isArray(source.pages) ? source.pages : []
+        this.scanResult.files = Array.isArray(source.files) ? source.files : []
+        this.scanResult.finishedAt = source.finishedAt || source.finished || null
+        this.currentScanId = scanId
+
+        const hydratedFindings = Array.isArray(source.findings) ? source.findings : []
+        hydratedFindings.forEach(item => {
+            try {
+                const prepared = this.prepareFindingMetadata(item)
+                if (!prepared) return
+                scanResultStore.upsertFinding({
+                    scanId,
+                    engine: "IAST",
+                    finding: prepared.finding,
+                    moduleMeta: prepared.moduleMeta,
+                    ruleMeta: prepared.ruleMeta
+                })
+            } catch (err) {
+                try { console.warn("[PTK IAST] Failed to hydrate finding", err) } catch (_) { }
+            }
+        })
+
         this._ingestLegacyRawFindings(Array.isArray(payload.rawFindings) ? payload.rawFindings : [])
-        if (Array.isArray(this.scanResult.rawFindings) && this.scanResult.rawFindings.length) {
-            this._ingestLegacyRawFindings(this.scanResult.rawFindings)
+        if (Array.isArray(source.rawFindings) && source.rawFindings.length) {
+            this._ingestLegacyRawFindings(source.rawFindings)
+        }
+        if (Array.isArray(this.scanResult.rawFindings)) {
             delete this.scanResult.rawFindings
         }
         this.requestLookup = new Map()
@@ -581,8 +712,12 @@ export class ptk_iast {
                 if (entry?.key) {
                     this.requestLookup.set(entry.key, entry)
                 }
+                if (entry?.url) {
+                    this._requestLookupByUrl.set(entry.url, entry)
+                }
             })
         }
+        this._rebuildPagesFromFindings()
         this.updateScanResult({ persist: false })
         return this.scanResult
     }
@@ -619,18 +754,28 @@ export class ptk_iast {
             if (entry?.key) {
                 this.requestLookup.delete(entry.key)
             }
+            if (entry?.url) {
+                this._requestLookupByUrl.delete(entry.url)
+            }
         })
     }
 
     _ingestLegacyRawFindings(rawList) {
-        if (!Array.isArray(rawList) || !rawList.length) return
+        if (!Array.isArray(rawList) || !rawList.length || !this.scanResult?.scanId) return
         rawList.forEach(item => {
             if (!item) return
             try {
                 const prepared = this.prepareFindingMetadata(item)
-                this._upsertFinding(prepared)
+                if (!prepared) return
+                scanResultStore.upsertFinding({
+                    scanId: this.scanResult.scanId,
+                    engine: "IAST",
+                    finding: prepared.finding,
+                    moduleMeta: prepared.moduleMeta,
+                    ruleMeta: prepared.ruleMeta
+                })
             } catch (e) {
-                try { console.warn('[PTK IAST DEBUG][background] failed to ingest legacy finding', e) } catch (_) { }
+                try { console.warn('[PTK IAST][background] failed to ingest legacy finding', e) } catch (_) { }
             }
         })
     }
@@ -641,7 +786,7 @@ export class ptk_iast {
             this.scanResult.requests = []
         }
         const url = evt?.url
-        if (!url) return
+        if (!url || !isHttpUrl(url)) return
         const method = evt?.method || 'GET'
         const key = this.buildRequestKey(method, url)
         if (!key) return
@@ -668,73 +813,190 @@ export class ptk_iast {
             this.requestLookup.set(key, entry)
             this.trimTrackedRequests()
         }
+        if (entry?.url) {
+            this._requestLookupByUrl.set(entry.url, entry)
+        }
+        this._updatePageRequestMetaForEntry(entry)
     }
 
-    _upsertFinding(finding) {
-        if (!finding) return
-        const findings = Array.isArray(this.scanResult.findings) ? this.scanResult.findings : (this.scanResult.findings = [])
-        const fingerprint = finding.fingerprint || getFindingFingerprint(finding)
-        const idx = findings.findIndex(item => (item?.fingerprint || getFindingFingerprint(item || {})) === fingerprint)
-        if (idx === -1) {
-            findings.push(finding)
-        } else {
-            const merged = mergeFinding(findings[idx], finding)
-            findings[idx] = this.prepareFindingMetadata(merged)
+    _resetPageIndexes() {
+        this._pagesByKey = new Map()
+        this._pagesByUrl = new Map()
+        this._pageFindingIds = new Map()
+        this._missingPageCounter = 0
+        if (this.scanResult) {
+            this.scanResult.pages = []
         }
     }
 
-    _rebuildGroupsFromFindings() {
-        this.scanResult.groups = []
-        const findings = Array.isArray(this.scanResult.findings) ? this.scanResult.findings : []
-        findings.forEach(finding => {
-            const evidenceList = Array.isArray(finding?.evidence) ? finding.evidence : []
-            const primaryEvidence = evidenceList.find(ev => String(ev?.source || '').toLowerCase() === 'iast') || evidenceList[0] || {}
-            const taintSource = primaryEvidence?.taintSource || primaryEvidence?.raw?.taintSource || finding?.taintSource || finding?.source || null
-            const sinkId = primaryEvidence?.sinkId || primaryEvidence?.raw?.sinkId || finding?.sinkId || null
-            const locationUrl = finding?.location?.url || ""
-            const groupKey = [
-                "IAST",
-                finding?.vulnId || finding?.category || 'runtime_issue',
-                locationUrl,
-                taintSource || "",
-                sinkId || finding?.ruleId || ""
-            ].join('@@')
-            addFindingToGroup(this.scanResult, finding, groupKey, {
-                url: locationUrl || null,
-                param: taintSource || null,
-                sink: sinkId || null
-            })
-        })
+    _rebuildPagesFromFindings() {
+        this._resetPageIndexes()
+        const items = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings : []
+        items.forEach((finding) => this._upsertPageFromFinding(finding))
     }
 
+    _resolveRequestEntryForFinding(finding) {
+        if (!finding) return null
+        const directKey = finding?.requestKey
+        if (directKey && this.requestLookup.has(directKey)) {
+            return this.requestLookup.get(directKey)
+        }
+        const urls = this.collectFindingUrls(finding)
+        const primaryUrl = (urls && urls.length) ? urls[0] : (finding?.location?.url || null)
+        if (!primaryUrl) return null
+        const normalized = this.normalizeRequestUrl(primaryUrl)
+        if (!normalized) return null
+        return this._requestLookupByUrl.get(normalized) || this.findRequestMetaForUrl(primaryUrl)
+    }
+
+    _resolveRequestKeyForFinding(finding) {
+        const entry = this._resolveRequestEntryForFinding(finding)
+        return entry?.key || null
+    }
+
+    _updatePageRequestMetaForEntry(entry) {
+        if (!entry || !entry.url) return
+        const key = this._pagesByUrl.get(entry.url)
+        if (!key) return
+        const page = this._pagesByKey.get(key)
+        if (!page) return
+        page.requestKey = entry.key || null
+        page.requestMeta = {
+            method: entry.method || null,
+            status: entry.status || null,
+            mimeType: entry.mimeType || null
+        }
+    }
+
+    _upsertPageFromFinding(finding) {
+        if (!finding) return
+        if (!Array.isArray(this.scanResult.pages)) {
+            this.scanResult.pages = []
+        }
+        const candidateUrls = this.collectFindingUrls(finding)
+        const normalizedPrimary = candidateUrls.length ? candidateUrls[0] : null
+        const pageUrl = finding?.location?.url || normalizedPrimary || null
+        let key = normalizedPrimary || pageUrl || null
+        if (!key) {
+            const fallbackId = finding?.id || finding?.fingerprint || this._missingPageCounter++
+            key = `__missing_url__${fallbackId}`
+        }
+        let page = this._pagesByKey.get(key)
+        if (!page) {
+            page = {
+                url: pageUrl || normalizedPrimary || null,
+                stats: {
+                    totalFindings: 0,
+                    byCategory: {},
+                    bySeverity: {}
+                },
+                findingIds: [],
+                requestKey: null,
+                requestMeta: {}
+            }
+            this._pagesByKey.set(key, page)
+            if (normalizedPrimary) {
+                const normalizedKey = this.normalizeRequestUrl(normalizedPrimary)
+                if (normalizedKey) {
+                    this._pagesByUrl.set(normalizedKey, key)
+                }
+            }
+            this.scanResult.pages.push(page)
+        }
+
+        const findingId = finding?.id || finding?.fingerprint || null
+        let idSet = this._pageFindingIds.get(key)
+        if (!idSet) {
+            idSet = new Set()
+            this._pageFindingIds.set(key, idSet)
+        }
+        if (findingId && idSet.has(findingId)) {
+            return
+        }
+        if (findingId) {
+            idSet.add(findingId)
+            page.findingIds.push(findingId)
+        }
+
+        const category = finding?.category || "runtime_issue"
+        const severity = String(finding?.severity || "info").toLowerCase()
+        page.stats.totalFindings += 1
+        page.stats.byCategory[category] = (page.stats.byCategory[category] || 0) + 1
+        page.stats.bySeverity[severity] = (page.stats.bySeverity[severity] || 0) + 1
+
+        if (!page.requestKey) {
+            const match = this._resolveRequestEntryForFinding(finding)
+            if (match) {
+                page.requestKey = match.key || null
+                page.requestMeta = {
+                    method: match.method || null,
+                    status: match.status || null,
+                    mimeType: match.mimeType || null
+                }
+            }
+        }
+    }
+
+
     prepareFindingMetadata(finding) {
-        if (!finding) return finding
+        if (!finding) return null
         if (!finding.location || typeof finding.location !== "object" || Array.isArray(finding.location)) {
             const rawValue = typeof finding.location === "string" ? finding.location : null
             finding.location = { url: rawValue }
         }
-        let classificationMeta = null
-        if (finding.ruleId) {
-            classificationMeta = getIastRuleMeta(finding.ruleId) || null
+        const ruleInfo = finding.ruleId ? getIastRuleMeta(finding.ruleId) : null
+        if (!ruleInfo && finding.ruleId) {
+            try {
+                console.warn(`[PTK][IAST] missing rule metadata for ruleId=${finding.ruleId}`)
+            } catch (_) { }
         }
-        if (!finding.ruleName && classificationMeta) {
-            finding.ruleName = classificationMeta.ruleName || classificationMeta?.ruleMeta?.name || finding.ruleId
+        let moduleInfo = ruleInfo?.moduleMeta || (finding.moduleId ? getIastModuleMeta(finding.moduleId) : null)
+        if (!moduleInfo && finding.moduleId) {
+            try {
+                console.warn(`[PTK][IAST] missing module metadata for moduleId=${finding.moduleId}`)
+            } catch (_) { }
         }
-        if (!finding.moduleName && classificationMeta) {
-            finding.moduleName = classificationMeta.moduleName || finding.moduleName || null
+        if (!moduleInfo && ruleInfo?.moduleId) {
+            moduleInfo = getIastModuleMeta(ruleInfo.moduleId) || moduleInfo
+        }
+        if (!finding.moduleId && moduleInfo?.id) {
+            finding.moduleId = moduleInfo.id
+        }
+        if (!finding.moduleName && moduleInfo?.name) {
+            finding.moduleName = moduleInfo.name
+        }
+        if (!finding.ruleName && ruleInfo?.ruleName) {
+            finding.ruleName = ruleInfo.ruleName
         }
         const urls = this.collectFindingUrls(finding)
         if (urls.length > 0) {
             finding.location.url = urls[0]
         }
         finding.affectedUrls = urls
+        if (!finding.requestKey) {
+            finding.requestKey = this._resolveRequestKeyForFinding(finding)
+        }
         const summary = this.buildTaintAndSinkSummaries(finding)
         finding.taintSummary = summary.taintSummary
         finding.sinkSummary = summary.sinkSummary
-        if (!Array.isArray(finding.evidence)) {
-            finding.evidence = []
+        const allowedSources = ruleInfo?.ruleMeta?.metadata?.sources || ruleInfo?.ruleMeta?.sources || null
+        if (Array.isArray(allowedSources) && allowedSources.length) {
+            finding.allowedSources = allowedSources.slice()
         }
-        return finding
+        if (finding?.evidence?.iast && typeof finding.evidence.iast === "object") {
+            finding.evidence.iast.taintSummary = summary.taintSummary
+            finding.evidence.iast.sinkSummary = summary.sinkSummary
+            if (Array.isArray(allowedSources) && allowedSources.length) {
+                finding.evidence.iast.allowedSources = allowedSources.slice()
+            }
+        }
+        const moduleMetaPayload = moduleInfo?.metadata || moduleInfo || {}
+        const ruleMetaPayload = (ruleInfo?.ruleMeta && (ruleInfo.ruleMeta.metadata || ruleInfo.ruleMeta)) || {}
+        return {
+            finding,
+            moduleMeta: moduleMetaPayload,
+            ruleMeta: ruleMetaPayload
+        }
     }
 
     collectFindingUrls(finding) {
@@ -745,6 +1007,9 @@ export class ptk_iast {
             if (normalized) urls.add(normalized)
         }
         const baseLocation = finding?.location
+        const ev = getIastEvidencePayload(finding)
+        const routingUrl = ev?.routing?.runtimeUrl || ev?.routing?.url || null
+        if (routingUrl) add(routingUrl)
         if (typeof baseLocation === "string") add(baseLocation)
         if (baseLocation && typeof baseLocation === "object") {
             add(baseLocation.url || baseLocation.href)
@@ -752,13 +1017,12 @@ export class ptk_iast {
         if (Array.isArray(finding?.affectedUrls)) {
             finding.affectedUrls.forEach(add)
         }
-        if (Array.isArray(finding?.evidence)) {
-            finding.evidence.forEach(ev => {
-                add(ev?.raw?.location)
-                add(ev?.raw?.context?.url)
-                add(ev?.context?.url)
-                add(ev?.context?.location)
-            })
+        if (ev) {
+            if (Array.isArray(ev.affectedUrls)) {
+                ev.affectedUrls.forEach(add)
+            }
+            add(ev?.context?.url)
+            add(ev?.context?.location)
         }
         if (urls.size === 0 && baseLocation?.url) {
             add(baseLocation.url)
@@ -782,6 +1046,9 @@ export class ptk_iast {
         for (const candidate of candidates) {
             try {
                 const u = new URL(candidate)
+                if (!/^https?:$/i.test(u.protocol)) {
+                    continue
+                }
                 let pathname = u.pathname || "/"
                 pathname = pathname.replace(/\/{2,}/g, "/")
                 if (pathname.length > 1 && pathname.endsWith("/")) pathname = pathname.slice(0, -1)
@@ -799,16 +1066,13 @@ export class ptk_iast {
         directSources.forEach(src => { if (src) sources.add(String(src)) })
         const directSinks = [finding?.sink, finding?.sinkId]
         directSinks.forEach(sink => { if (sink) sinks.add(String(sink)) })
-        if (Array.isArray(finding?.evidence)) {
-            finding.evidence.forEach(ev => {
-                const safeEv = ev || {}
-                const raw = safeEv.raw || {}
-                ;[safeEv.taintSource, raw.taintSource, raw.source].forEach(src => {
-                    if (src) sources.add(String(src))
-                })
-                ;[safeEv.sinkId, raw.sinkId, raw.sink].forEach(sink => {
-                    if (sink) sinks.add(String(sink))
-                })
+        const evidence = getIastEvidencePayload(finding)
+        if (evidence) {
+            ;[evidence.taintSource, evidence.sourceId].forEach(src => {
+                if (src) sources.add(String(src))
+            })
+            ;[evidence.sinkId].forEach(sink => {
+                if (sink) sinks.add(String(sink))
             })
         }
         const sourcesArr = Array.from(sources)
@@ -830,11 +1094,13 @@ export class ptk_iast {
         const map = new Map()
         items.forEach((finding, index) => {
             if (!finding) return
-            const pageUrl = finding?.location?.url || this.normalizeFindingUrl(finding?.affectedUrls?.[0])
-            const key = pageUrl || `__missing_url__${index}`
+            const candidateUrls = this.collectFindingUrls(finding)
+            const normalizedPrimary = candidateUrls.length ? candidateUrls[0] : null
+            const pageUrl = finding?.location?.url || normalizedPrimary
+            const key = normalizedPrimary || pageUrl || `__missing_url__${index}`
             if (!map.has(key)) {
                 map.set(key, {
-                    url: pageUrl || null,
+                    url: pageUrl || normalizedPrimary || null,
                     stats: {
                         totalFindings: 0,
                         byCategory: {},
@@ -893,6 +1159,19 @@ export class ptk_iast {
                 channel: "ptk_background_iast2popup",
                 type: "scan_update",
                 scanResult: this._getPublicScanResult(),
+                isScanRunning: this.isScanRunning
+            }).catch(() => { })
+        } catch (_) { }
+    }
+
+    broadcastScanDelta(finding) {
+        if (!finding) return
+        try {
+            browser.runtime.sendMessage({
+                channel: "ptk_background_iast2popup",
+                type: "scan_delta",
+                finding,
+                stats: this.scanResult?.stats || {},
                 isScanRunning: this.isScanRunning
             }).catch(() => { })
         } catch (_) { }
@@ -962,6 +1241,7 @@ export class ptk_iast {
 
         if (method === "Network.requestWillBeSent") {
             const request = params && params.request ? params.request : {}
+            if (!isHttpUrl(request.url)) return
             const evt = {
                 type: "devtools-http-request",
                 time: Date.now(),
@@ -975,6 +1255,7 @@ export class ptk_iast {
 
         if (method === "Network.responseReceived") {
             const response = params && params.response ? params.response : {}
+            if (!isHttpUrl(response.url)) return
             const evt = {
                 type: "devtools-http-response",
                 time: Date.now(),
@@ -985,32 +1266,91 @@ export class ptk_iast {
                 tabId: source.tabId
             }
             this.recordHttpEvent(evt)
+            this.captureAuthResponseTokens({
+                tabId: source.tabId,
+                requestId: params && params.requestId ? params.requestId : null,
+                url: response.url,
+                mimeType: response.mimeType
+            })
         }
     }
 
-    _normalizeEnvelope(envelope) {
-        const out = envelope && typeof envelope === "object" ? envelope : {}
-        if (!Array.isArray(out.httpEvents)) out.httpEvents = []
-        if (!Array.isArray(out.runtimeEvents)) out.runtimeEvents = []
-        if (!Array.isArray(out.requests)) out.requests = []
-        if (!Array.isArray(out.pages)) out.pages = []
-        if (!Array.isArray(out.findings)) out.findings = []
-        if (!Array.isArray(out.groups)) out.groups = []
-        if (!Array.isArray(out.files)) out.files = []
-        if (out.items !== undefined) delete out.items
-        if (out.vulns !== undefined) delete out.vulns
-        out.version = out.version || "1.0"
-        out.engine = out.engine || "IAST"
-        out.startedAt = out.startedAt || out.date || new Date().toISOString()
-        if (out.date) delete out.date
-        if (typeof out.finishedAt === "undefined") out.finishedAt = out.finished || null
-        if (out.finished) delete out.finished
-        if (out.type !== undefined) delete out.type
-        if (!out.settings || typeof out.settings !== "object") out.settings = {}
-        if (!out.stats || typeof out.stats !== "object") {
-            out.stats = { findingsCount: 0, high: 0, medium: 0, low: 0 }
+    isLikelyAuthEndpoint(url) {
+        if (!url) return false
+        const lower = String(url).toLowerCase()
+        return /(login|auth|token|session)/.test(lower)
+    }
+
+    async captureAuthResponseTokens({ tabId, requestId, url, mimeType }) {
+        if (!tabId || !requestId || !url) return
+        if (!mimeType || !String(mimeType).toLowerCase().includes("json")) return
+        if (!this.isLikelyAuthEndpoint(url)) return
+        if (typeof chrome === "undefined" || !chrome.debugger) return
+        const target = { tabId }
+        chrome.debugger.sendCommand(target, "Network.getResponseBody", { requestId }, (resp) => {
+            if (chrome.runtime.lastError || !resp || !resp.body) return
+            const bodyText = resp.base64Encoded ? atob(resp.body) : resp.body
+            if (!bodyText || bodyText.length > 200000) return
+            let parsed
+            try {
+                parsed = JSON.parse(bodyText)
+            } catch (_) {
+                return
+            }
+            const tokens = this.extractTokenCandidates(parsed).map(entry => ({
+                value: entry.value,
+                origin: {
+                    kind: "http_response",
+                    url,
+                    requestId,
+                    detail: entry.path
+                }
+            }))
+            if (!tokens.length) return
+            try {
+                browser.tabs.sendMessage(tabId, {
+                    channel: "ptk_background_iast2content_token_origin",
+                    tokens
+                }).catch((err) => {
+                    console.warn("[PTK IAST] token origin send failed", err)
+                })
+            } catch (err) {
+                console.warn("[PTK IAST] token origin send exception", err)
+            }
+        })
+    }
+
+    extractTokenCandidates(payload, path = "$") {
+        const results = []
+        const tokenKeys = ["token", "access_token", "refresh_token", "jwt", "auth", "session"]
+        if (payload && typeof payload === "object") {
+            Object.entries(payload).forEach(([key, value]) => {
+                const lower = String(key).toLowerCase()
+                const nextPath = `${path}.${key}`
+                if (typeof value === "string") {
+                    if (tokenKeys.some(k => lower.includes(k)) || this.isTokenLike(value)) {
+                        results.push({ path: nextPath, value })
+                    }
+                } else if (value && typeof value === "object") {
+                    if (Object.keys(value).length <= 12) {
+                        results.push(...this.extractTokenCandidates(value, nextPath))
+                    }
+                }
+            })
         }
-        return out
+        return results
+    }
+
+    isTokenLike(value) {
+        if (!value) return false
+        const str = String(value).trim()
+        if (str.length < 12) return false
+        if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(str) && str.length >= 30) {
+            return true
+        }
+        if (/^[A-Fa-f0-9]+$/.test(str) && str.length >= 32) return true
+        if (/^[A-Za-z0-9+/_=-]+$/.test(str) && str.length >= 24) return true
+        return false
     }
 
     registerScript() {

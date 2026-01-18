@@ -36,7 +36,7 @@ export class ptk_jwt {
 
     async msg_init(message) {
         this.storage = await ptk_storage.getItem(this.storageKey)
-        let activeTab = worker.ptk_app.proxy.activeTab
+        let activeTab = worker.ptk_app.proxy.getDashboardTab()
         let cookies = []
         if (activeTab?.tabId) cookies = await worker.ptk_app.session.getAllCookiesByTab(activeTab.tabId)
         return Promise.resolve(Object.assign({}, {

@@ -46,21 +46,42 @@
         "selector:document_query": {
             "id": "selector:document_query",
             "description": "document.querySelector( selector )",
-            "pattern": {"call": {"callee": {"member": ["document", "querySelector"]}, "argIndex": 0}}
+            "guard": "dom_selector",
+            "pattern": {"call": {"callee": {"memberAny": {"of": [["document", "querySelector"], ["window", "document", "querySelector"]]}}, "argIndex": 0}}
         },
         "selector:document_query_all": {
             "id": "selector:document_query_all",
             "description": "document.querySelectorAll( selector )",
-            "pattern": {"call": {"callee": {"member": ["document", "querySelectorAll"]}, "argIndex": 0}}
+            "guard": "dom_selector",
+            "pattern": {"call": {"callee": {"memberAny": {"of": [["document", "querySelectorAll"], ["window", "document", "querySelectorAll"]]}}, "argIndex": 0}}
         },
-        "selector:prop_query": {"id": "selector:prop_query", "description": "element.querySelector( selector )", "pattern": {"call": {"calleeProp": "querySelector", "argIndex": 0}}},
-        "selector:prop_query_all": {"id": "selector:prop_query_all", "description": "element.querySelectorAll( selector )", "pattern": {"call": {"calleeProp": "querySelectorAll", "argIndex": 0}}},
+        "selector:document_getElementById": {
+            "id": "selector:document_getElementById",
+            "description": "document.getElementById( id )",
+            "guard": "dom_selector",
+            "pattern": {"call": {"callee": {"memberAny": {"of": [["document", "getElementById"], ["window", "document", "getElementById"]]}}, "argIndex": 0}}
+        },
+        "selector:document_getElementsByClassName": {
+            "id": "selector:document_getElementsByClassName",
+            "description": "document.getElementsByClassName( className )",
+            "guard": "dom_selector",
+            "pattern": {"call": {"callee": {"memberAny": {"of": [["document", "getElementsByClassName"], ["window", "document", "getElementsByClassName"]]}}, "argIndex": 0}}
+        },
+        "selector:document_getElementsByTagName": {
+            "id": "selector:document_getElementsByTagName",
+            "description": "document.getElementsByTagName( tagName )",
+            "guard": "dom_selector",
+            "pattern": {"call": {"callee": {"memberAny": {"of": [["document", "getElementsByTagName"], ["window", "document", "getElementsByTagName"]]}}, "argIndex": 0}}
+        },
+        "selector:prop_query": {"id": "selector:prop_query", "description": "element.querySelector( selector )", "guard": "dom_selector", "pattern": {"call": {"calleeProp": "querySelector", "argIndex": 0}}},
+        "selector:prop_query_all": {"id": "selector:prop_query_all", "description": "element.querySelectorAll( selector )", "guard": "dom_selector", "pattern": {"call": {"calleeProp": "querySelectorAll", "argIndex": 0}}},
         "selector:jquery_root": {
             "id": "selector:jquery_root",
             "description": "jQuery root selector $(selector) or jQuery(selector)",
+            "guard": "dom_selector",
             "pattern": [{"call": {"callee": {"identifier": "$"}, "argIndex": 0}}, {"call": {"callee": {"identifier": "jQuery"}, "argIndex": 0}}]
         },
-        "selector:jquery_find": {"id": "selector:jquery_find", "description": "$(\\u2026).find(selector)", "pattern": {"call": {"calleeProp": "find", "argIndex": 0}}},
+        "selector:jquery_find": {"id": "selector:jquery_find", "description": "$(\\u2026).find(selector)", "guard": "dom_selector", "pattern": {"call": {"calleeProp": "find", "argIndex": 0}}},
         "client:sql_execute": {"id": "client:sql_execute", "description": "WebSQL executeSql(query, params)", "pattern": {"call": {"calleeProp": "executeSql", "argIndex": 0}}},
         "client:json_parse": {"id": "client:json_parse", "description": "JSON.parse(value)", "pattern": {"call": {"callee": {"member": ["JSON", "parse"]}, "argIndex": 0}}},
         "client:jquery_parsejson": {
@@ -117,16 +138,80 @@
             "description": "element.outerHTML assignment",
             "pattern": [{"assignment": {"left": {"memberProp": "outerHTML"}}}, {"assignment": {"left": {"chainMember": "outerHTML"}}}, {"assignment": {"left": {"memberPropRegex": "^outerHTML$"}}}]
         },
+        "dom:angular_property_innerHTML": {
+            "id": "dom:angular_property_innerHTML",
+            "description": "Angular ɵɵproperty('innerHTML'|'outerHTML', value)",
+            "framework": "angular",
+            "api": "ɵɵproperty('innerHTML', ...)",
+            "argIndex": 1,
+            "pattern": [
+                {
+                    "call": {
+                        "callee": {"identifierRegex": "ɵɵproperty$"},
+                        "args": [{"index": 0, "regex": "^(innerHTML|outerHTML)$"}],
+                        "argIndex": 1
+                    }
+                },
+                {
+                    "call": {
+                        "calleePropRegex": "ɵɵproperty$",
+                        "args": [{"index": 0, "regex": "^(innerHTML|outerHTML)$"}],
+                        "argIndex": 1
+                    }
+                }
+            ]
+        },
+        "dom:angular_renderer_setProperty": {
+            "id": "dom:angular_renderer_setProperty",
+            "description": "Angular renderer.setProperty(el, 'innerHTML'|'outerHTML', value)",
+            "framework": "angular",
+            "api": "setProperty('innerHTML', ...)",
+            "argIndex": 2,
+            "pattern": [
+                {
+                    "call": {
+                        "callee": {"identifier": "setProperty"},
+                        "args": [{"index": 1, "regex": "^(innerHTML|outerHTML)$"}],
+                        "argIndex": 2
+                    }
+                },
+                {
+                    "call": {
+                        "calleeProp": "setProperty",
+                        "args": [{"index": 1, "regex": "^(innerHTML|outerHTML)$"}],
+                        "argIndex": 2
+                    }
+                }
+            ]
+        },
+        "dom:angular_bypassSecurityTrust": {
+            "id": "dom:angular_bypassSecurityTrust",
+            "description": "Angular DomSanitizer.bypassSecurityTrust* (HTML/Style/Script/Url/ResourceUrl)",
+            "framework": "angular",
+            "api": "bypassSecurityTrust*",
+            "argIndex": 0,
+            "pattern": [
+                {
+                    "call": {
+                        "calleePropRegex": "^bypassSecurityTrust(?:Html|Style|Script|Url|ResourceUrl)$",
+                        "calleePropCaseInsensitive": true,
+                        "argIndex": 0
+                    }
+                }
+            ]
+        },
         "dom:document_write": {"id": "dom:document_write", "description": "document.write()", "pattern": {"call": {"callee": {"member": ["document", "write"]}, "argIndex": 0}}},
         "dom:document_writeln": {"id": "dom:document_writeln", "description": "document.writeln(ARG)", "pattern": {"call": {"callee": {"member": ["document", "writeln"]}, "argIndex": 0}}},
         "dom:event_handler_assign": {
             "id": "dom:event_handler_assign",
             "description": "el.onclick = '...'/ string to on* handler",
+            "guard": "event_handler_string",
             "pattern": {"assignment": {"left": {"memberPropRegex": "^on[a-z]+"}}}
         },
         "dom:setAttribute_on": {
             "id": "dom:setAttribute_on",
             "description": "el.setAttribute('on*', '...')",
+            "guard": "event_handler_string",
             "pattern": {"call": {"callee": {"member": ["*", "setAttribute"]}, "args": [{"index": 0, "regex": "^on[a-z]+$", "flags": "i"}]}}
         },
         "dom:srcdoc": {"id": "dom:srcdoc", "description": "iframe.srcdoc = '...'", "pattern": {"assignment": {"left": {"memberProp": "srcdoc"}}}},
@@ -412,6 +497,7 @@
         "dom:prop_on": {
             "id": "dom:prop_on",
             "description": "Property assignment to inline event handler (on*)",
+            "guard": "event_handler_string",
             "pattern": {"assignment": {"left": {"memberPropRegex": "^on[a-z]+", "caseInsensitive": true}}}
         },
         "js:setTimeout_code": {
@@ -469,16 +555,19 @@
         "dom:Element_matches_selector": {
             "id": "dom:Element_matches_selector",
             "description": "element.matches(selector)",
+            "guard": "dom_selector",
             "pattern": {"call": {"calleeProp": "matches", "argIndex": 0}}
         },
         "dom:Element_closest_selector": {
             "id": "dom:Element_closest_selector",
             "description": "element.closest(selector)",
+            "guard": "dom_selector",
             "pattern": {"call": {"calleeProp": "closest", "argIndex": 0}}
         },
         "jquery:on_selector": {
             "id": "jquery:on_selector",
             "description": "$(root).on(event, selector, handler) delegated selector argument",
+            "guard": "dom_selector",
             "pattern": {"call": {"calleeProp": "on", "args": [{"index": 1, "required": true}, {"index": 2, "required": true}], "argIndex": 1}}
         },
         "template:underscore_source": {
@@ -637,6 +726,20 @@
                 }
             }
         },
+        "http:response": {
+            "id": "http:response",
+            "origin_kind": "network",
+            "description": "HTTP client response (fetch/axios/Angular HttpClient)",
+            "pattern": [
+                {"call": {"callee": {"identifier": "fetch"}}},
+                {"call": {"callee": {"memberAny": {"of": [["http", "get"], ["*", "http", "get"], ["axios", "get"], ["*", "axios", "get"]]}}}},
+                {"call": {"callee": {"memberAny": {"of": [["http", "post"], ["*", "http", "post"], ["axios", "post"], ["*", "axios", "post"]]}}}},
+                {"call": {"callee": {"memberAny": {"of": [["http", "put"], ["*", "http", "put"], ["axios", "put"], ["*", "axios", "put"]]}}}},
+                {"call": {"callee": {"memberAny": {"of": [["http", "patch"], ["*", "http", "patch"], ["axios", "patch"], ["*", "axios", "patch"]]}}}},
+                {"call": {"callee": {"memberAny": {"of": [["http", "delete"], ["*", "http", "delete"], ["axios", "delete"], ["*", "axios", "delete"]]}}}},
+                {"call": {"callee": {"memberAny": {"of": [["http", "request"], ["*", "http", "request"], ["axios", "request"], ["*", "axios", "request"]]}}}}
+            ]
+        },
         "location:hash": {
             "id": "location:hash",
             "origin_kind": "url",
@@ -662,6 +765,12 @@
                 {"member": ["self", "location", "search"], "caseInsensitive": false},
                 {"member": ["top", "location", "search"], "caseInsensitive": false}
             ]
+        },
+        "url:searchparams_get": {
+            "id": "url:searchparams_get",
+            "origin_kind": "url",
+            "description": "URLSearchParams.get() derived from location hash/search/href",
+            "kind": "engine_builtin"
         },
         "location:self": {
             "id": "location:self",
@@ -700,6 +809,54 @@
                 {"member": ["global", "location", "pathname"], "caseInsensitive": false},
                 {"member": ["self", "location", "pathname"], "caseInsensitive": false},
                 {"member": ["top", "location", "pathname"], "caseInsensitive": false}
+            ]
+        },
+        "router:snapshot_queryParams": {
+            "id": "router:snapshot_queryParams",
+            "origin_kind": "url",
+            "description": "Router snapshot.queryParams (SPA route params).",
+            "pattern": [
+                {"memberAny": {"of": [["*", "snapshot", "queryParams"]]}}
+            ]
+        },
+        "router:snapshot_queryParams_prop": {
+            "id": "router:snapshot_queryParams_prop",
+            "origin_kind": "url",
+            "description": "Router snapshot.queryParams.<prop> (SPA route params).",
+            "pattern": [
+                {"memberAny": {"of": [["*", "snapshot", "queryParams", "*"]]}}
+            ]
+        },
+        "router:snapshot_queryParamMap_get": {
+            "id": "router:snapshot_queryParamMap_get",
+            "origin_kind": "url",
+            "description": "Router snapshot.queryParamMap.get(param).",
+            "pattern": [
+                {"call": {"callee": {"memberAny": {"of": [["*", "snapshot", "queryParamMap", "get"]]}}}}
+            ]
+        },
+        "router:queryParamMap_get": {
+            "id": "router:queryParamMap_get",
+            "origin_kind": "url",
+            "description": "Router queryParamMap.get(param).",
+            "pattern": [
+                {"call": {"callee": {"memberAny": {"of": [["*", "queryParamMap", "get"]]}}}}
+            ]
+        },
+        "router:queryParams": {
+            "id": "router:queryParams",
+            "origin_kind": "url",
+            "description": "Router queryParams direct access (best-effort, non-RxJS).",
+            "pattern": [
+                {"memberAny": {"of": [["*", "queryParams"]]}}
+            ]
+        },
+        "router:queryParams_prop": {
+            "id": "router:queryParams_prop",
+            "origin_kind": "url",
+            "description": "Router queryParams.<prop> direct access (best-effort, non-RxJS).",
+            "pattern": [
+                {"memberAny": {"of": [["*", "queryParams", "*"]]}}
             ]
         },
         "sw:fetch_request_url": {
@@ -1033,7 +1190,7 @@
             "description": "Treat simple string transforms as identity (limited depth).",
             "notes": "Keeps noise low; does not include replace() or regex ops.",
             "depth_limit": 1,
-            "propagate": {"passthrough_call": ["trim", "slice", "substring", "concat", "toString"]}
+            "propagate": {"passthrough_call": ["trim", "slice", "substring", "concat", "toString", "split"]}
         },
         "prop:passthrough_any_call": {
             "id": "prop:passthrough_any_call",
@@ -1091,11 +1248,22 @@
                                     ["*searchParams*", "get"]
                                 ]
                             }
-                        },
-                        "argIndex": 0
+                        }
                     }
                 }
             ]
+        },
+        "prop:decode_uri": {
+            "id": "prop:decode_uri",
+            "kind": "call_passthrough",
+            "description": "decodeURIComponent(arg) propagates taint from the decoded input.",
+            "patterns": [{"call": {"callee": {"identifier": "decodeURIComponent"}, "argIndex": 0}}]
+        },
+        "prop:callback:rxjs_subscribe": {
+            "id": "prop:callback:rxjs_subscribe",
+            "kind": "callback_adapter",
+            "description": "Observable.subscribe(cb): stream values flow into cb param.",
+            "patterns": [{"call": {"calleeProp": "subscribe", "argIndex": 0}}]
         },
         "prop:json_parse": {
             "id": "prop:json_parse",

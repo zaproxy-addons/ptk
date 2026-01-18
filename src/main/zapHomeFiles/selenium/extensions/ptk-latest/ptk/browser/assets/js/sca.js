@@ -50,7 +50,7 @@ jQuery(function () {
     })
 
     $(document).on("click", ".run_scan_runtime", function () {
-        controller.init().then(function (result) {
+        controller.init().then(async function (result) {
             if (!result?.activeTab?.url) {
                 $('#result_header').text("Error")
                 $('#result_message').text("Active tab not set. Reload required tab to activate tracking.")
@@ -61,6 +61,11 @@ jQuery(function () {
             let h = new URL(result.activeTab.url).host
             $('#scan_host').text(h)
             // $('#scan_domains').text(h)
+            window._ptkScaReloadWarningClosed = false
+            const contentReady = await rutils.pingContentScript(result.activeTab.tabId, { timeoutMs: 700 })
+            if (!window._ptkScaReloadWarningClosed) {
+                $('#ptk_scan_reload_warning').toggle(!contentReady)
+            }
 
             $('#run_scan_dlg')
                 .modal({
@@ -77,6 +82,11 @@ jQuery(function () {
         })
 
         return false
+    })
+
+    $(document).on("click", "#ptk_scan_reload_warning_close_sca", function () {
+        window._ptkScaReloadWarningClosed = true
+        $('#ptk_scan_reload_warning').hide()
     })
 
     $(document).on("click", ".stop_scan_runtime", function () {
@@ -131,9 +141,9 @@ jQuery(function () {
     })
 
     $('.export_scan_btn').on('click', function () {
-        controller.init().then(function (result) {
-            if (Array.isArray(result.scanResult?.findings) && result.scanResult.findings.length > 0) {
-                let blob = new Blob([JSON.stringify(result.scanResult)], { type: 'text/plain' })
+        controller.exportScanResult().then(function (scanResult) {
+            if (Array.isArray(scanResult?.findings) && scanResult.findings.length > 0) {
+                let blob = new Blob([JSON.stringify(scanResult)], { type: 'text/plain' })
                 let fName = "PTK_SCA_scan.json"
 
                 let downloadLink = document.createElement("a")
@@ -141,7 +151,11 @@ jQuery(function () {
                 downloadLink.innerHTML = "Download File"
                 downloadLink.href = window.URL.createObjectURL(blob)
                 downloadLink.click()
+            } else {
+                showScaResultModal('Error', 'Nothing to export yet.')
             }
+        }).catch(err => {
+            showScaResultModal('Error', err?.message || 'Unable to export scan')
         })
     })
 
@@ -290,7 +304,7 @@ jQuery(function () {
     $(document).on("bind_stats", function (e, scanResult) {
         if (scanResult?.stats) {
             rutils.bindStats(scanResult.stats, 'sca')
-            if (scanResult.stats.vulnsCount > 0) {
+            if ((scanResult.stats.findingsCount || 0) > 0) {
                 $('#filter_vuln').trigger("click")
             }
         }
@@ -698,15 +712,20 @@ function filterByRequestId(requestId) {
 }
 
 function showWelcomeForm() {
+    setScaPageLoader(false)
+    $('#main').hide()
     $('#welcome_message').show()
     $('#run_scan_bg_control').show()
 }
 
 function hideWelcomeForm() {
     $('#welcome_message').hide()
+    $('#main').show()
 }
 
 function showRunningForm(result) {
+    setScaPageLoader(false)
+    $('#main').show()
     $('#scanning_url').text(result.scanResult.host)
     $('.scan_info').show()
     $('#stop_scan_bg_control').show()
@@ -719,11 +738,19 @@ function hideRunningForm() {
 }
 
 function showScanForm(result) {
+    setScaPageLoader(false)
+    $('#main').show()
     $('#run_scan_bg_control').show()
 }
 
 function hideScanForm() {
     $('#run_scan_bg_control').hide()
+}
+
+function setScaPageLoader(show) {
+    const $loader = $('#sca_page_loader')
+    if (!$loader.length) return
+    $loader.toggle(!!show)
 }
 
 
@@ -750,7 +777,7 @@ function cleanScanResult() {
     clearScaPanels()
     rutils.bindStats({
         attacksCount: 0,
-        vulnsCount: 0,
+        findingsCount: 0,
         critical: 0,
         high: 0,
         medium: 0,
@@ -763,7 +790,8 @@ function cleanScanResult() {
 function bindScanResult(result) {
     if (!result.scanResult) return
     controller.scanResult = result.scanResult
-    scaComponents = Array.isArray(result.scanResult.findings) ? result.scanResult.findings : []
+    const flatFindings = Array.isArray(result.scanResult.findings) ? result.scanResult.findings : []
+    scaComponents = buildScaComponentsFromFindings(flatFindings)
     if (selectedComponentKey) {
         const exists = scaComponents.some(component => getComponentKey(component) === selectedComponentKey)
         if (!exists) {
@@ -825,8 +853,20 @@ function renderScaFindings() {
     }
     const sortedEntries = sortScaEntries(entries)
     updateScaStatsFromEntries(sortedEntries)
-    const html = sortedEntries
-        .map((entry, idx) => rutils.bindSCAFinding(entry.component, entry.finding, idx))
+    const bucketMarkup = {
+        critical: [],
+        high: [],
+        medium: [],
+        low: [],
+        info: []
+    }
+    const bucketOrder = ['critical', 'high', 'medium', 'low', 'info']
+    sortedEntries.forEach((entry, idx) => {
+        const bucket = getScaBucket(entry?.finding)
+        bucketMarkup[bucket].push(rutils.bindSCAFinding(entry.component, entry.finding, idx))
+    })
+    const html = bucketOrder
+        .map((bucket) => `<div class="sca_bucket${bucketMarkup[bucket].length ? ' has-items' : ''}" data-bucket="${bucket}">${bucketMarkup[bucket].join('')}</div>`)
         .join('')
     $details.html(html)
 }
@@ -853,6 +893,15 @@ function buildPlaceholderHtml(icon, title, subtitle = '') {
                 ${safeSubtitle}
             </div>
         </div>`
+}
+
+function getScaBucket(finding) {
+    const severity = String(finding?.severity || 'info').toLowerCase()
+    if (severity === 'critical') return 'critical'
+    if (severity === 'high') return 'high'
+    if (severity === 'medium') return 'medium'
+    if (severity === 'low') return 'low'
+    return 'info'
 }
 
 function clearScaPanels() {
@@ -919,6 +968,71 @@ function updateScaStatsFromEntries(entries) {
         return acc
     }, { findingsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 })
     rutils.bindStats(stats, 'sca')
+}
+
+function buildScaComponentsFromFindings(findings = []) {
+    const map = new Map()
+    findings.forEach(finding => {
+        const transformed = transformFindingForUi(finding)
+        if (!transformed) return
+        const key = transformed.key
+        if (!map.has(key)) {
+            map.set(key, {
+                component: transformed.component,
+                version: transformed.version,
+                file: transformed.file,
+                findings: []
+            })
+        }
+        map.get(key).findings.push(transformed.finding)
+    })
+    return Array.from(map.values())
+}
+
+function transformFindingForUi(finding) {
+    if (!finding || (finding.engine && finding.engine !== "SCA")) return null
+    const evidence = finding.evidence?.sca || {}
+    const componentInfo = evidence.component || {}
+    const componentName = componentInfo.name || componentInfo.component || finding.ruleName || 'Dependency'
+    const version = componentInfo.version || 'n/a'
+    const file = evidence.sourceFile || finding.location?.file || null
+    const key = getComponentKey({ component: componentName, file })
+    const identifiers = cloneIdentifiers(evidence.identifiers)
+    const summary = evidence.summary || identifiers.summary || finding.description || finding.ruleName || null
+    if (summary && (!identifiers.summary || typeof identifiers.summary !== "string")) {
+        identifiers.summary = summary
+    }
+    const versionRange = evidence.versionRange || {}
+    const convertedFinding = {
+        severity: finding.severity || 'medium',
+        identifiers,
+        info: Array.isArray(evidence.info) ? evidence.info.slice() : [],
+        cwe: finding.cwe,
+        atOrAbove: versionRange.atOrAbove || null,
+        above: versionRange.above || null,
+        atOrBelow: versionRange.atOrBelow || null,
+        below: versionRange.below || null
+    }
+    return {
+        key,
+        component: componentName,
+        version,
+        file,
+        finding: convertedFinding
+    }
+}
+
+function cloneIdentifiers(raw) {
+    if (!raw || typeof raw !== 'object') return {}
+    try {
+        return JSON.parse(JSON.stringify(raw))
+    } catch (_) {
+        const copy = {}
+        Object.keys(raw).forEach(key => {
+            copy[key] = raw[key]
+        })
+        return copy
+    }
 }
 
 

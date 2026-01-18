@@ -1,13 +1,14 @@
 /* Author: Denis Podgurskii */
 export class ptk_controller_sast {
 
-    async runBackroungScan(tabId, host, policy){
+    async runBackroungScan(tabId, host, scanStrategy, pages = null){
         return browser.runtime.sendMessage({
             channel: "ptk_popup2background_sast",
             type: "run_bg_scan",
             tabId: tabId,
             host: host,
-            policy: policy
+            scanStrategy: scanStrategy,
+            pages: pages
         }).then(response => {
             return response
         }).catch(e => e)
@@ -118,6 +119,15 @@ export class ptk_controller_sast {
         }).then(response => {
             return response
         }).catch(e => e)
+    }
+
+    async exportScanResult(target = "download") {
+        return browser.runtime.sendMessage({
+            channel: "ptk_popup2background_sast",
+            type: "export_scan_result",
+            target
+        }).then(response => response)
+            .catch(e => e)
     }
 
 }

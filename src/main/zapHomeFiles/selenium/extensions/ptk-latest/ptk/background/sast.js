@@ -16,6 +16,10 @@ import {
   normalizeRulepack,
   resolveEffectiveSeverity,
 } from "./common/severity_utils.js";
+import { resolveFindingTaxonomy } from "./common/resolveFindingTaxonomy.js";
+import normalizeFinding from "./common/findingNormalizer.js";
+import buildExportScanResult from "./export/buildExportScanResult.js";
+import { applyRouteToFinding, isHashOnlyNavigation } from "./sast/spa_utils.js";
 
 const worker = self;
 
@@ -26,11 +30,21 @@ export class ptk_sast {
     this.activeTabId = null;
     this.resetScanResult();
     this.defaultModulesCache = null;
+    this._persistTimer = null;
+    this._persistDebounceMs = 1000;
+    this._rulesIndex = new Set();
 
     this.onSastWorkerMessage = this.onSastWorkerMessage.bind(this);
     this.onOffscreenMessage = this.onOffscreenMessage.bind(this);
     this.sastWorker = null;
     this.offscreenInitPromise = null;
+    this.pendingScriptRequests = new Map();
+    this.pendingScanResults = new Map();
+    this.multiPageScanActive = false;
+    this.spaPageSet = new Set();
+    this.spaScanInFlight = new Set();
+    this.scanHeartbeatTimer = null;
+    this.scanStartMs = null;
 
     this.addMessageListeners();
     this.ensureFirefoxWorker();
@@ -56,18 +70,47 @@ export class ptk_sast {
   }
 
   async init() {
-    if (!this.isScanRunning) {
-      this.storage = await ptk_storage.getItem(this.storageKey);
-      if (Object.keys(this.storage).length > 0) {
-        this.scanResult = this._normalizeEnvelope(this.storage);
-      }
+    this.storage = await ptk_storage.getItem(this.storageKey);
+    if (!this.storage || !Object.keys(this.storage).length) return;
+
+    const storedPayload = this._unwrapStoredScanResult(this.storage);
+    const stored = this._normalizeEnvelope(storedPayload);
+    const storedFindings = Array.isArray(stored?.findings) ? stored.findings.length : 0;
+    const currentFindings = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings.length : 0;
+    const currentScanId = this.scanResult?.scanId || null;
+    const storedScanId = stored?.scanId || null;
+
+    if (!currentScanId || currentScanId !== storedScanId || currentFindings === 0) {
+      this.scanResult = stored;
+      this._primeSpaPages();
+      this._seedRulesIndexFromFindings();
+    } else if (this.isScanRunning && storedFindings > currentFindings) {
+      this.scanResult = stored;
+      this._primeSpaPages();
+      this._seedRulesIndexFromFindings();
     }
+  }
+
+  _cloneScanResultForUi() {
+    const clone = JSON.parse(JSON.stringify(this.scanResult || {}));
+    if (clone && typeof clone === "object") {
+      clone.__normalized = true;
+    }
+    return clone;
   }
 
   resetScanResult() {
     this.isScanRunning = false;
     this.activeTabId = null;
+    this.multiPageScanActive = false;
+    this.spaPageSet = new Set();
+    this.spaScanInFlight = new Set();
     this.scanResult = this.getScanResultSchema();
+    this._rulesIndex = new Set();
+    if (this._persistTimer) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
   }
 
   getScanResultSchema() {
@@ -83,6 +126,7 @@ export class ptk_sast {
     delete envelope.tabId;
     delete envelope.items;
     envelope.files = Array.isArray(envelope.files) ? envelope.files : [];
+    envelope.pages = Array.isArray(envelope.pages) ? envelope.pages : [];
     return this._normalizeEnvelope(envelope);
   }
 
@@ -119,6 +163,10 @@ export class ptk_sast {
     browser.webRequest.onCompleted.removeListener(this.onCompleted);
   }
 
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   onRemoved(tabId, info) {
     if (this.activeTabId === tabId) {
       this.activeTabId = null;
@@ -143,16 +191,93 @@ export class ptk_sast {
 
     if (message.channel == "ptk_content_sast2background_sast") {
       if (message.type == "scripts_collected") {
+        const requestId = message.requestId || null;
+        if (requestId && this.pendingScriptRequests.has(requestId)) {
+          const pending = this.pendingScriptRequests.get(requestId);
+          this.pendingScriptRequests.delete(requestId);
+          pending.resolve(message);
+          return;
+        }
+        if (this.multiPageScanActive) return;
         if (this.isScanRunning && this.activeTabId == sender.tab.id) {
           this.scanCode(message.scripts, message.html, message.file).catch(e => console.error("SAST scanCode failed", e));
         }
       }
+      if (message.type == "spa_url_changed" && sender?.tab?.id) {
+        this.onSpaUrlChanged(message.url, sender.tab.id).catch(err => {
+        });
+        return Promise.resolve({ ok: true });
+      }
+    }
+  }
+
+  _primeSpaPages() {
+    this.spaPageSet = new Set();
+    const pages = Array.isArray(this.scanResult?.pages) ? this.scanResult.pages : [];
+    pages.forEach(entry => {
+      const url = typeof entry === "string" ? entry : entry?.url;
+      if (url) this.spaPageSet.add(url);
+    });
+  }
+
+  _registerSpaPage(url) {
+    if (!url) return false;
+    if (!Array.isArray(this.scanResult.pages)) {
+      this.scanResult.pages = [];
+    }
+    if (this.spaPageSet.has(url)) return false;
+    this.spaPageSet.add(url);
+    this.scanResult.pages.push(url);
+    this._schedulePersistScanResult();
+    return true;
+  }
+
+  async onSpaUrlChanged(rawUrl, tabId) {
+    if (!rawUrl || !tabId) return;
+    if (!this.isScanRunning || this.activeTabId !== tabId) return;
+    const normalized = this.normalizeSpaPages([rawUrl], null)[0];
+    if (!normalized) return;
+    const isNew = this._registerSpaPage(normalized);
+    if (this.multiPageScanActive) return;
+    if (!isNew) return;
+    if (this.spaScanInFlight.has(normalized)) return;
+    this.spaScanInFlight.add(normalized);
+    try {
+      await this.waitForSpaIdle(tabId, 500);
+      const payload = await this.requestScriptsFromTab(tabId).catch(() => null);
+      if (!payload?.scripts) return;
+      await this.scanCode(payload.scripts, payload.html, payload.file)
+        .catch((err) => console.error("SAST scanCode failed", err));
+    } finally {
+      this.spaScanInFlight.delete(normalized);
     }
   }
 
   onOffscreenMessage(message) {
     const { type, scanId, info, file, findings, error } = message;
-    if (!this.scanResult?.scanId || scanId !== this.scanResult.scanId) return;
+    if (!this.scanResult?.scanId) {
+      this.scanResult = this._normalizeEnvelope(createScanResultEnvelope({
+        engine: "SAST",
+        scanId: scanId || null,
+        host: null,
+        tabId: null,
+        startedAt: new Date().toISOString(),
+        settings: {}
+      }));
+      this.isScanRunning = true;
+    }
+    if (scanId !== this.scanResult.scanId) {
+      const currentFindings = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings.length : 0;
+      const currentFiles = Array.isArray(this.scanResult?.files) ? this.scanResult.files.length : 0;
+      const hasData = currentFindings > 0 || currentFiles > 0;
+      if (!hasData && scanId) {
+        this.scanResult.scanId = scanId;
+        this.isScanRunning = true;
+        this._schedulePersistScanResult();
+      } else {
+        return;
+      }
+    }
 
     if (this.isStructuredEvent(type)) {
       this.handleStructuredEvent(type, message);
@@ -165,6 +290,11 @@ export class ptk_sast {
     }
 
     if (type === "scan_result") {
+      this.handleScanResultFromWorker(file, findings);
+      this.resolvePendingScanResult(file, findings);
+      return;
+    }
+    if (type === "findings:partial") {
       this.handleScanResultFromWorker(file, findings);
       return;
     }
@@ -183,8 +313,7 @@ export class ptk_sast {
     browser.runtime.sendMessage({
       channel: "ptk_background2popup_sast",
       type: "progress",
-      info: data,
-      scanResult: JSON.parse(JSON.stringify(this.scanResult))
+      info: data
     }).catch(e => e);
   }
 
@@ -195,17 +324,26 @@ export class ptk_sast {
 
     if (!normalized.length) return;
 
+    if (!this.isScanRunning) {
+      this.isScanRunning = true;
+      this._startScanHeartbeat();
+    }
+    const unifiedFindings = [];
     normalized.forEach((finding, index) => {
       finding.pageUrl = pageUrl;
       finding.pageCanon = pageCanon;
-      this._addUnifiedFinding(finding, index);
+      applyRouteToFinding(finding, pageUrl);
+      const unified = this._addUnifiedFinding(finding, index);
+      if (unified) unifiedFindings.push(unified);
     });
     this.updateScanResult();
-    ptk_storage.setItem(this.storageKey, this.scanResult);
     browser.runtime.sendMessage({
       channel: "ptk_background2popup_sast",
-      type: "update findings",
-      scanResult: JSON.parse(JSON.stringify(this.scanResult))
+      type: "findings_delta",
+      findings: unifiedFindings.length ? unifiedFindings : normalized,
+      stats: this.scanResult.stats || {},
+      files: pageUrl ? [pageUrl] : [],
+      isScanRunning: this.isScanRunning
     }).catch(e => e);
   }
 
@@ -225,9 +363,27 @@ export class ptk_sast {
     const data = payload?.payload || payload || {};
     const clone = () => JSON.parse(JSON.stringify(this.scanResult));
     const file = data.file;
+    if (type === "scan:start") {
+      this.isScanRunning = true;
+      this._startScanHeartbeat();
+    }
+    if (type === "scan:summary") {
+      this.isScanRunning = false;
+      this._stopScanHeartbeat();
+      this._rebuildGroupsFromFindings();
+      this.updateScanResult();
+      this._flushPersistScanResult();
+      browser.runtime.sendMessage({
+        channel: "ptk_background2popup_sast",
+        type,
+        payload: data
+      }).catch(() => { });
+      return;
+    }
     if (type === "file:start") {
       if (file && !file.startsWith("about:") && !this.scanResult.files.includes(file)) {
         this.scanResult.files.push(file);
+        this.updateScanResult();
       }
       browser.runtime.sendMessage({
         channel: "ptk_background2popup_sast",
@@ -238,12 +394,11 @@ export class ptk_sast {
       return;
     }
 
-    if (type === "file:end" || type === "scan:start" || type === "scan:summary") {
+    if (type === "file:end" || type === "scan:start") {
       browser.runtime.sendMessage({
         channel: "ptk_background2popup_sast",
         type,
-        payload: data,
-        scanResult: clone()
+        payload: data
       }).catch(() => { });
       return;
     }
@@ -259,6 +414,7 @@ export class ptk_sast {
 
     if (type === "scan:error") {
       this.isScanRunning = false;
+      this._stopScanHeartbeat();
       browser.runtime.sendMessage({
         channel: "ptk_background2popup_sast",
         type,
@@ -267,9 +423,56 @@ export class ptk_sast {
     }
   }
 
+  _startScanHeartbeat() {
+    this._stopScanHeartbeat();
+    this.scanStartMs = Date.now();
+    this.scanHeartbeatTimer = setInterval(() => {
+      if (!this.isScanRunning) return;
+      const elapsedMs = Date.now() - (this.scanStartMs || Date.now());
+      const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+      const mins = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+      const secs = String(totalSeconds % 60).padStart(2, "0");
+      browser.runtime.sendMessage({
+        channel: "ptk_background2popup_sast",
+        type: "progress",
+        info: { message: "Scanning", file: `${mins}:${secs} elapsed` }
+      }).catch(() => { });
+    }, 2000);
+  }
+
+  _stopScanHeartbeat() {
+    if (this.scanHeartbeatTimer) {
+      clearInterval(this.scanHeartbeatTimer);
+      this.scanHeartbeatTimer = null;
+    }
+    this.scanStartMs = null;
+  }
+
   onSastWorkerMessage(event) {
     const { type, scanId, info, file, findings, error } = event.data || {};
-    if (!this.scanResult?.scanId || scanId !== this.scanResult.scanId) return;
+    if (!this.scanResult?.scanId) {
+      this.scanResult = this._normalizeEnvelope(createScanResultEnvelope({
+        engine: "SAST",
+        scanId: scanId || null,
+        host: null,
+        tabId: null,
+        startedAt: new Date().toISOString(),
+        settings: {}
+      }));
+      this.isScanRunning = true;
+    }
+    if (scanId !== this.scanResult.scanId) {
+      const currentFindings = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings.length : 0;
+      const currentFiles = Array.isArray(this.scanResult?.files) ? this.scanResult.files.length : 0;
+      const hasData = currentFindings > 0 || currentFiles > 0;
+      if (!hasData && scanId) {
+        this.scanResult.scanId = scanId;
+        this.isScanRunning = true;
+        this._schedulePersistScanResult();
+      } else {
+        return;
+      }
+    }
 
     if (this.isStructuredEvent(type)) {
       this.handleStructuredEvent(type, event.data);
@@ -282,6 +485,11 @@ export class ptk_sast {
     }
 
     if (type === "scan_result") {
+      this.handleScanResultFromWorker(file, findings);
+      this.resolvePendingScanResult(file, findings);
+      return;
+    }
+    if (type === "findings:partial") {
       this.handleScanResultFromWorker(file, findings);
       return;
     }
@@ -343,35 +551,98 @@ export class ptk_sast {
     if (!Array.isArray(this.scanResult.findings)) {
       this.scanResult.findings = [];
     }
-    this._rebuildGroupsFromFindings();
-    this._recalculateStats(this.scanResult);
+    this._ensureStats();
+    this.scanResult.stats.filesCount = Array.isArray(this.scanResult.files)
+      ? this.scanResult.files.length
+      : 0;
+    this.scanResult.stats.rulesCount = this._rulesIndex ? this._rulesIndex.size : 0;
+    this._schedulePersistScanResult();
+  }
+
+  _schedulePersistScanResult() {
+    if (this._persistTimer) return;
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      // Debounce storage writes to reduce MV2 overhead.
+      ptk_storage.setItem(this.storageKey, this.scanResult);
+    }, this._persistDebounceMs);
+  }
+
+  _flushPersistScanResult() {
+    if (this._persistTimer) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
     ptk_storage.setItem(this.storageKey, this.scanResult);
+  }
+
+  _ensureStats() {
+    if (!this.scanResult.stats || typeof this.scanResult.stats !== "object") {
+      this.scanResult.stats = {
+        findingsCount: 0,
+        filesCount: 0,
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        info: 0,
+        rulesCount: 0
+      };
+    }
+  }
+
+  _applySeverityDelta(severity, delta) {
+    this._ensureStats();
+    const sev = String(severity || "info").toLowerCase();
+    const field = (sev === "critical" || sev === "high" || sev === "medium" || sev === "low" || sev === "info")
+      ? sev
+      : "info";
+    this.scanResult.stats[field] = Math.max(0, (this.scanResult.stats[field] || 0) + delta);
+  }
+
+  _trackRuleId(ruleId) {
+    if (!ruleId) return;
+    if (!this._rulesIndex) this._rulesIndex = new Set();
+    this._rulesIndex.add(ruleId);
+    this.scanResult.stats.rulesCount = this._rulesIndex.size;
+  }
+
+  _seedRulesIndexFromFindings() {
+    this._rulesIndex = new Set();
+    const findings = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings : [];
+    findings.forEach((finding) => {
+      if (finding?.ruleId) this._rulesIndex.add(finding.ruleId);
+    });
+    this._ensureStats();
+    this.scanResult.stats.rulesCount = this._rulesIndex.size;
   }
 
   _recalculateStats(envelope) {
     if (!envelope) return;
     const findings = Array.isArray(envelope.findings) ? envelope.findings : [];
-    const stats = { findingsCount: findings.length, critical: 0, high: 0, medium: 0, low: 0, info: 0, rulesCount: 0 };
+    const filesCount = Array.isArray(envelope.files) ? envelope.files.length : 0;
+    const stats = {
+      findingsCount: findings.length,
+      filesCount,
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      info: 0,
+      rulesCount: 0
+    };
+    const uniqueRuleIds = new Set();
     findings.forEach(finding => {
-      const sev = (finding?.severity || '').toLowerCase();
-      if (sev === 'critical') stats.critical += 1;
-      else if (sev === 'high') stats.high += 1;
-      else if (sev === 'medium') stats.medium += 1;
-      else if (sev === 'low') stats.low += 1;
+      const sev = (finding?.severity || "").toLowerCase();
+      if (sev === "critical") stats.critical += 1;
+      else if (sev === "high") stats.high += 1;
+      else if (sev === "medium") stats.medium += 1;
+      else if (sev === "low") stats.low += 1;
       else stats.info += 1;
+      if (finding?.ruleId) uniqueRuleIds.add(finding.ruleId);
     });
+    stats.rulesCount = uniqueRuleIds.size;
     envelope.stats = stats;
-    this._setRulesCount(envelope);
-  }
-
-  _setRulesCount(envelope) {
-    if (!envelope) return;
-    const findings = Array.isArray(envelope.findings) ? envelope.findings : [];
-    const uniqueRuleIds = new Set(findings.map((finding) => finding?.ruleId).filter(Boolean));
-    if (!envelope.stats || typeof envelope.stats !== "object") {
-      envelope.stats = { findingsCount: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0, rulesCount: 0 };
-    }
-    envelope.stats.rulesCount = uniqueRuleIds.size;
   }
 
   // ---- URL / file canonicalization helpers ----
@@ -446,7 +717,7 @@ export class ptk_sast {
         html,
         file
       });
-      return [];
+      return this.waitForScanResult(file);
     }
 
     if (!worker.isFirefox) {
@@ -463,7 +734,7 @@ export class ptk_sast {
       } catch (err) {
         console.error("Failed to send code to SAST offscreen worker", err);
       }
-      return [];
+      return this.waitForScanResult(file);
     }
 
     if (!this.sastEngine) return [];
@@ -472,11 +743,146 @@ export class ptk_sast {
     return findings;
   }
 
+  waitForScanResult(file, timeoutMs = 30000) {
+    if (!file) return Promise.resolve([]);
+    if (this.pendingScanResults.has(file)) {
+      return this.pendingScanResults.get(file).promise;
+    }
+    let resolve;
+    const promise = new Promise((res) => {
+      resolve = res;
+    });
+    const timer = setTimeout(() => {
+      if (this.pendingScanResults.has(file)) {
+        this.pendingScanResults.delete(file);
+      }
+      resolve([]);
+    }, timeoutMs);
+    this.pendingScanResults.set(file, { resolve, timer, promise });
+    return promise;
+  }
+
+  resolvePendingScanResult(file, findings) {
+    if (!file) return;
+    const pending = this.pendingScanResults.get(file);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingScanResults.delete(file);
+    pending.resolve(findings || []);
+  }
+
+  async requestScriptsFromTab(tabId, timeoutMs = 8000) {
+    const requestId = `sast_scripts_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingScriptRequests.delete(requestId);
+        reject(new Error("sast_scripts_timeout"));
+      }, timeoutMs);
+      this.pendingScriptRequests.set(requestId, {
+        resolve: (payload) => {
+          clearTimeout(timer);
+          resolve(payload);
+        },
+        reject,
+      });
+    });
+
+    try {
+      await browser.tabs.sendMessage(tabId, {
+        channel: "ptk_background2content_sast",
+        type: "collect_scripts",
+        requestId,
+      });
+    } catch (err) {
+      this.pendingScriptRequests.delete(requestId);
+      throw err;
+    }
+    return promise;
+  }
+
+  normalizeSpaPages(pages, baseUrl) {
+    if (!Array.isArray(pages)) return [];
+    const normalized = [];
+    const seen = new Set();
+    for (const entry of pages) {
+      const raw = (entry || "").toString().trim();
+      if (!raw) continue;
+      let url = raw;
+      try {
+        if (baseUrl) {
+          url = new URL(raw, baseUrl).toString();
+        } else if (!/^https?:\/\//i.test(raw)) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (!seen.has(url)) {
+        seen.add(url);
+        normalized.push(url);
+      }
+    }
+    return normalized;
+  }
+
+  async scanSpaPages(tabId, pages, opts = {}) {
+    const delayMs = Number(opts.spaDelayMs || opts.pageDelayMs || 1000);
+    for (const pageUrl of pages) {
+      if (!pageUrl) continue;
+      const tab = await browser.tabs.get(tabId).catch(() => null);
+      const currentUrl = tab?.url || "";
+      const useHashNav = isHashOnlyNavigation(currentUrl, pageUrl);
+      if (useHashNav) {
+        const hash = new URL(pageUrl).hash || "";
+        try {
+          await browser.tabs.sendMessage(tabId, {
+            channel: "ptk_background2content_sast",
+            type: "sast_set_hash",
+            hash
+          });
+        } catch (err) {
+          console.error("[SAST] Failed to set SPA hash", hash, err);
+        }
+      } else {
+        try {
+          await browser.tabs.update(tabId, { url: pageUrl });
+        } catch (err) {
+          console.error("[SAST] Failed to navigate to page", pageUrl, err);
+          continue;
+        }
+      }
+      await this.waitForSpaIdle(tabId, delayMs);
+      let payload;
+      try {
+        payload = await this.requestScriptsFromTab(tabId);
+      } catch (err) {
+        console.error("[SAST] Failed to collect scripts for page", pageUrl, err);
+        continue;
+      }
+      if (!payload?.scripts) continue;
+      await this.scanCode(payload.scripts, payload.html, payload.file)
+        .catch((err) => console.error("SAST scanCode failed", err));
+    }
+  }
+
+  async waitForSpaIdle(tabId, delayMs = 500) {
+    try {
+      await browser.tabs.sendMessage(tabId, {
+        channel: "ptk_background2content_sast",
+        type: "sast_wait_ready",
+        delayMs
+      });
+    } catch (err) {
+      await this.sleep(delayMs);
+    }
+  }
+
   async msg_init(message) {
     await this.init();
     const defaultModules = await this.getDefaultModules();
+    const count = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings.length : 0;
     return Promise.resolve({
-      scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+      scanResult: this._cloneScanResultForUi(),
       isScanRunning: this.isScanRunning,
       activeTab: worker.ptk_app.proxy.activeTab,
       default_modules: defaultModules
@@ -487,7 +893,7 @@ export class ptk_sast {
     this.reset();
     const defaultModules = await this.getDefaultModules();
     return Promise.resolve({
-      scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+      scanResult: this._cloneScanResultForUi(),
       activeTab: worker.ptk_app.proxy.activeTab,
       default_modules: defaultModules
     });
@@ -516,9 +922,11 @@ export class ptk_sast {
     this.reset();
     const normalized = this._normalizeEnvelope(imported);
     this.scanResult = normalized;
-    ptk_storage.setItem(this.storageKey, normalized);
+    this._seedRulesIndexFromFindings();
+    this._recalculateStats(this.scanResult);
+    this._flushPersistScanResult();
     return Promise.resolve({
-      scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+      scanResult: this._cloneScanResultForUi(),
       isScanRunning: this.isScanRunning,
       activeTab: worker.ptk_app.proxy.activeTab,
     });
@@ -534,12 +942,28 @@ export class ptk_sast {
       ]);
       normalizeRulepack(rulepack, { engine: 'SAST', childKey: 'rules' })
 
-      await this.runBackroungScan(message.tabId, message.host, message.policy, { rulepack, catalog });
+      const scanStrategyRaw = message.scanStrategy ?? message.policy;
+      const scanStrategySettings = (scanStrategyRaw && typeof scanStrategyRaw === "object") ? scanStrategyRaw : {};
+      let scanStrategyCode = (typeof scanStrategyRaw === "number" || typeof scanStrategyRaw === "string")
+        ? Number(scanStrategyRaw)
+        : Number(scanStrategySettings.scanStrategyCode ?? scanStrategySettings.scanStrategy ?? scanStrategySettings.policyCode ?? scanStrategySettings.policy ?? 0);
+      if (!Number.isFinite(scanStrategyCode)) scanStrategyCode = 0;
+      const scanStrategy = Object.assign({}, scanStrategySettings, { scanStrategyCode });
+      const pages = Array.isArray(message.pages) ? message.pages : null;
+      const opts = {
+        rulepack,
+        catalog,
+        pages: pages || scanStrategy.pages || scanStrategy.routes || [],
+        spaDelayMs: scanStrategy.spaDelayMs || scanStrategy.spaDelay || message.spaDelayMs || null,
+        scanStrategyCode,
+      };
+
+      await this.runBackroungScan(message.tabId, message.host, scanStrategy, opts);
       const defaultModules = await this.getDefaultModules(rulepack);
 
       return {
         isScanRunning: this.isScanRunning,
-        scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+        scanResult: this._cloneScanResultForUi(),
         success: true,
         default_modules: defaultModules
       };
@@ -553,7 +977,7 @@ export class ptk_sast {
   msg_stop_bg_scan(message) {
     this.stopBackroungScan();
     return Promise.resolve({
-      scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+      scanResult: this._cloneScanResultForUi(),
     });
   }
 
@@ -599,7 +1023,13 @@ export class ptk_sast {
     if (!url) {
       return { success: false, json: { message: "Portal endpoint is not configured." } };
     }
-    const payload = JSON.parse(JSON.stringify(this.scanResult));
+    const payload = buildExportScanResult(this.scanResult?.scanId, {
+      target: "portal",
+      scanResult: this.scanResult
+    });
+    if (!payload) {
+      return { success: false, json: { message: "Scan result is empty" } };
+    }
     if (message?.projectId) {
       payload.projectId = message.projectId;
     }
@@ -622,6 +1052,25 @@ export class ptk_sast {
       })
       .catch(e => ({ success: false, json: { message: "Error while saving report: " + e.message } }));
     return response;
+  }
+
+  async msg_export_scan_result(message) {
+    if (!this.scanResult || Object.keys(this.scanResult).length === 0) {
+      const stored = await ptk_storage.getItem(this.storageKey);
+      if (stored && Object.keys(stored).length) {
+        this.scanResult = this._normalizeEnvelope(this._unwrapStoredScanResult(stored));
+      }
+    }
+    if (!this.scanResult) return null;
+    try {
+      return buildExportScanResult(this.scanResult?.scanId, {
+        target: message?.target || "download",
+        scanResult: this.scanResult
+      });
+    } catch (err) {
+      console.error("[PTK SAST] Failed to export scan result", err);
+      throw err;
+    }
   }
 
   async msg_download_scans(message) {
@@ -694,8 +1143,9 @@ export class ptk_sast {
           return { success: false, json: json || { message: "Unable to download scan" } };
         }
         if (json) {
-          this.scanResult = json;
-          ptk_storage.setItem(this.storageKey, json);
+          this.scanResult = this._normalizeEnvelope(json);
+          this._seedRulesIndexFromFindings();
+          this._flushPersistScanResult();
         }
         return json;
       })
@@ -751,22 +1201,33 @@ export class ptk_sast {
     return normalizedBase + normalizedApiBase + normalizedEndpoint;
   }
 
-  async runBackroungScan(tabId, host, policy, opts) {
+  async runBackroungScan(tabId, host, scanStrategy, opts) {
+    if (this.isScanRunning) {
+      return false;
+    }
     this.reset();
     this.isScanRunning = true;
     this.scanningRequest = false;
     this.activeTabId = tabId;
     const scanId = ptk_utils.UUID();
+    this._startScanHeartbeat();
+    const scanStrategyCode = Number.isFinite(opts?.scanStrategyCode)
+      ? Number(opts.scanStrategyCode)
+      : (typeof scanStrategy === "number" || typeof scanStrategy === "string")
+        ? Number(scanStrategy)
+        : 0;
+    const settings = (scanStrategy && typeof scanStrategy === "object") ? scanStrategy : { scanStrategyCode };
     this.scanResult = this._normalizeEnvelope(createScanResultEnvelope({
       engine: "SAST",
       scanId,
       host,
       tabId,
       startedAt: new Date().toISOString(),
-      settings: policy || {}
+      settings
     }));
     this.scanResult.host = host;
-    this.scanResult.policy = policy;
+    this.scanResult.scanStrategy = settings;
+    this._schedulePersistScanResult();
     opts = Object.assign({}, opts, { scanId: this.scanResult.scanId });
 
     if (worker.isFirefox) {
@@ -778,7 +1239,7 @@ export class ptk_sast {
       this.sastWorker.postMessage({
         type: "start_scan",
         scanId: this.scanResult.scanId,
-        policy,
+        scanStrategy: scanStrategyCode,
         opts
       });
     } else if (!worker.isFirefox) {
@@ -788,14 +1249,14 @@ export class ptk_sast {
           channel: "ptk_bg2offscreen_sast",
           type: "start_scan",
           scanId: this.scanResult.scanId,
-          policy,
+          scanStrategy: scanStrategyCode,
           opts
         });
       } catch (err) {
         console.error("Failed to start SAST offscreen worker", err);
       }
     } else {
-      this.sastEngine = new sastEngine(policy, opts);
+      this.sastEngine = new sastEngine(scanStrategyCode, opts);
       if (this.scanBus) this.scanBus = null;
       this.scanBus = new SastScanBus(this, this.sastEngine);
       this.scanBus.attach();
@@ -805,6 +1266,25 @@ export class ptk_sast {
     }
     
     this.addListeners();
+
+    let baseUrl = host || null;
+    try {
+      const tab = await browser.tabs.get(tabId);
+      baseUrl = tab?.url || baseUrl;
+    } catch { }
+
+    const pages = this.normalizeSpaPages(
+      opts?.pages || scanStrategy?.pages || scanStrategy?.routes || [],
+      baseUrl
+    );
+    this.multiPageScanActive = pages.length > 0;
+    if (pages.length) {
+      this.scanResult.pages = pages;
+      this._primeSpaPages();
+      this.scanSpaPages(tabId, pages, opts).catch((err) => {
+        console.error("[SAST] Multi-page SPA scan failed", err);
+      });
+    }
   }
 
   stopBackroungScan() {
@@ -821,14 +1301,27 @@ export class ptk_sast {
     }
 
     this.isScanRunning = false;
+    this._stopScanHeartbeat();
     this.activeTabId = null;
     if (this.scanResult) {
       const finished = new Date().toISOString();
       this.scanResult.finishedAt = finished;
     }
+    this.pendingScriptRequests.clear();
+    this.pendingScanResults.clear();
+    this.multiPageScanActive = false;
     this.sastEngine = null;
     this.scanBus = null;
-    ptk_storage.setItem(this.storageKey, this.scanResult);
+    const findingsCount = Array.isArray(this.scanResult?.findings) ? this.scanResult.findings.length : 0;
+    const filesCount = Array.isArray(this.scanResult?.files) ? this.scanResult.files.length : 0;
+    const pagesCount = Array.isArray(this.scanResult?.pages) ? this.scanResult.pages.length : 0;
+    const groupsCount = Array.isArray(this.scanResult?.groups) ? this.scanResult.groups.length : 0;
+    const hasContent = findingsCount > 0 || filesCount > 0 || pagesCount > 0 || groupsCount > 0;
+    if (hasContent) {
+      this._rebuildGroupsFromFindings();
+      this.updateScanResult();
+      this._flushPersistScanResult();
+    }
     this.removeListeners();
   }
 
@@ -836,6 +1329,7 @@ export class ptk_sast {
     const unifiedFinding = this._composeUnifiedFinding(finding, index, this.scanResult);
     if (!unifiedFinding) return;
     this._upsertUnifiedFinding(unifiedFinding);
+    return unifiedFinding;
   }
 
   _composeUnifiedFinding(finding, index = 0, targetEnvelope = null) {
@@ -858,16 +1352,25 @@ export class ptk_sast {
     const scanId = envelopeRef?.scanId || this.scanResult?.scanId || null;
     const createdAt = envelopeRef?.finishedAt || this.scanResult?.finishedAt || new Date().toISOString();
     const fingerprint = finding.fingerprint || this._buildSastFingerprintFromRaw(finding)
+    const pageUrl = locationMeta.pageUrl || locationMeta.url || finding.pageUrl || finding.pageCanon || null;
+    const runtimeUrl = locationMeta.runtimeUrl || pageUrl || null;
     const location = {
       file: locationMeta.file || finding.codeFile || finding.file || null,
       line: locationMeta.line ?? finding?.sink?.sinkLoc?.start?.line ?? finding?.source?.sourceLoc?.start?.line ?? null,
       column: locationMeta.column ?? finding?.sink?.sinkLoc?.start?.column ?? finding?.source?.sourceLoc?.start?.column ?? null,
-      pageUrl: locationMeta.pageUrl || locationMeta.url || finding.pageUrl || finding.pageCanon || null
+      runtimeUrl,
+      pageUrl,
+      url: pageUrl || null,
+      param: locationMeta.param || finding.param || null
     };
     const tracePayload = Array.isArray(finding.trace)
       ? finding.trace
       : (Array.isArray(finding?.evidence?.sast?.trace) ? finding.evidence.sast.trace : []);
-    return {
+    const confidence = Number.isFinite(finding.confidence) ? finding.confidence : null;
+    const confidenceSignals = Array.isArray(finding?.evidence?.sast?.confidenceSignals)
+      ? finding.evidence.sast.confidenceSignals
+      : [];
+    const unifiedFinding = {
       id: `${scanId || 'scan'}::SAST::${moduleId}::${ruleId}::${index}`,
       engine: "SAST",
       scanId,
@@ -887,6 +1390,7 @@ export class ptk_sast {
       location,
       createdAt,
       fingerprint,
+      confidence,
       evidence: {
         sast: {
           codeSnippet: finding.codeSnippet || null,
@@ -894,9 +1398,24 @@ export class ptk_sast {
           sink: finding.sink || null,
           nodeType: finding.nodeType || null,
           trace: tracePayload || [],
+          mode: finding.mode || finding?.evidence?.sast?.mode || null,
+          confidenceSignals
         }
       }
     };
+    resolveFindingTaxonomy({
+      finding: unifiedFinding,
+      ruleMeta,
+      moduleMeta
+    });
+    const normalizedFinding = normalizeFinding({
+      engine: "SAST",
+      moduleMeta,
+      ruleMeta,
+      scanId,
+      finding: unifiedFinding
+    });
+    return normalizedFinding;
   }
 
   _registerFindingGroup(envelope, unifiedFinding) {
@@ -983,8 +1502,22 @@ export class ptk_sast {
     const idx = this.scanResult.findings.findIndex(item => this._buildSastFingerprintFromUnified(item) === fingerprint)
     if (idx === -1) {
       this.scanResult.findings.push(finding)
+      this._ensureStats()
+      this.scanResult.stats.findingsCount += 1
+      this._applySeverityDelta(finding?.severity, 1)
+      this._trackRuleId(finding?.ruleId)
     } else {
+      const prev = this.scanResult.findings[idx]
+      const prevSeverity = String(prev?.severity || "info").toLowerCase()
+      const nextSeverity = String(finding?.severity || "info").toLowerCase()
       this.scanResult.findings[idx] = finding
+      if (prevSeverity !== nextSeverity) {
+        this._applySeverityDelta(prevSeverity, -1)
+        this._applySeverityDelta(nextSeverity, 1)
+      }
+      if (prev?.ruleId !== finding?.ruleId) {
+        this._trackRuleId(finding?.ruleId)
+      }
     }
   }
 
@@ -1010,7 +1543,15 @@ export class ptk_sast {
     if (out.tabId !== undefined) delete out.tabId;
     if (out.type !== undefined) delete out.type;
     if (!out.settings || typeof out.settings !== "object") out.settings = {};
-    const statsDefaults = { findingsCount: 0, high: 0, medium: 0, low: 0, info: 0, rulesCount: 0 };
+    const statsDefaults = {
+      findingsCount: 0,
+      filesCount: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      info: 0,
+      rulesCount: 0
+    };
     const legacyItems = this._collectLegacyItems(envelope?.items);
     const hasFindings = Array.isArray(out.findings) && out.findings.length > 0;
     if (!hasFindings && legacyItems.length) {
@@ -1035,5 +1576,13 @@ export class ptk_sast {
     if (out.items !== undefined) delete out.items;
     this._recalculateStats(out);
     return out;
+  }
+
+  _unwrapStoredScanResult(stored) {
+    if (!stored || typeof stored !== "object") return stored;
+    if (stored.scanResult && typeof stored.scanResult === "object") {
+      return stored.scanResult;
+    }
+    return stored;
   }
 }

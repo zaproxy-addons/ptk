@@ -1,5 +1,6 @@
 /* Author: Denis Podgurskii */
 import { ptk_controller_proxy } from "../../../controller/proxy.js"
+import { registerDashboardTabListener, updateDashboardTab } from "../js/rutils.js"
 const controller = new ptk_controller_proxy()
 
 jQuery(function () {
@@ -39,9 +40,13 @@ jQuery(function () {
     $(document).on("click", "#download_domain_list", function () {
         let data = controller.domains
         if (data != null) {
+            let hostname = "ptk"
+            try {
+                if (controller.url) hostname = (new URL(controller.url)).hostname
+            } catch (_) { }
             let blob = new Blob([data.join("\r\n")], { type: 'text/plain' })
             let downloadLink = document.createElement("a")
-            downloadLink.download = "PTK_domains_" + (new URL(controller.url)).hostname + ".txt"
+            downloadLink.download = "PTK_domains_" + hostname + ".txt"
             downloadLink.href = window.URL.createObjectURL(blob)
             downloadLink.click()
         }
@@ -50,9 +55,13 @@ jQuery(function () {
     $(document).on("click", "#download_url_list", function () {
         let data = controller.urls
         if (data != null) {
+            let hostname = "ptk"
+            try {
+                if (controller.url) hostname = (new URL(controller.url)).hostname
+            } catch (_) { }
             let blob = new Blob([data.join("\r\n")], { type: 'text/plain' })
             let downloadLink = document.createElement("a")
-            downloadLink.download = "PTK_urls_" + (new URL(controller.url)).hostname + ".txt"
+            downloadLink.download = "PTK_urls_" + hostname + ".txt"
             downloadLink.href = window.URL.createObjectURL(blob)
             downloadLink.click()
         }
@@ -89,6 +98,13 @@ jQuery(function () {
     }
 
     setTimeout(function () { bindAll() }, 100)
+
+    registerDashboardTabListener({
+        onTabChange: async ({ tabId, url }) => {
+            await updateDashboardTab(tabId, url)
+            bindAll()
+        }
+    })
 })
 
 /* Helpers */
@@ -203,4 +219,3 @@ browser.runtime.onMessage.addListener(function (message, sender, sendResponse) {
         }
     }
 })
-

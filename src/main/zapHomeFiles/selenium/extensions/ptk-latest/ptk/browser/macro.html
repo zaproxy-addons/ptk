@@ -36,8 +36,8 @@
 </head>
 
 <body>
-    <!-- <div id="mainMenuWrapper"></div> -->
-    <div id="pagecontent" style="min-height:500px;    padding-top: 34px;">
+    <div id="mainMenuWrapper"></div>
+    <div id="pagecontent" style="min-height:500px; padding-top: 4px;">
         <form class="ui form controls" id="macro_form">
             <input type="hidden" name="url" >
             <!-- request params -->
@@ -97,7 +97,7 @@
                                                             class="question circle icon min_duration"
                                                             style='cursor:pointer; float: right'
                                                             data-content="Use this value to set min delay for each event when export a macro"></i>
-                                                        </<label>
+                                                    </label>
                                                 </div>
                                                 <div class="seven wide field ui input">
                                                     <input type="text" name="min_duration" placeholder="3000"
@@ -175,6 +175,12 @@
                                                         </div>
                                                         <div class="field" style="padding: 2px">
                                                             <div class="ui slider small form checkbox">
+                                                                <input type="radio" name="element_path" value="css">
+                                                                <label>CSS selector</label>
+                                                            </div>
+                                                        </div>
+                                                        <div class="field" style="padding: 2px">
+                                                            <div class="ui slider small form checkbox">
                                                                 <input type="radio" name="element_path"
                                                                     value="fullpath">
                                                                 <label>Full path</label>
@@ -189,10 +195,10 @@
                                     </div>
 
                                 </div>
-                                <!-- <div class="active title" style="background-color: #eeeeee;">
+                                <div class=" title" style="background-color: #eeeeee;">
                                     <i class="dropdown icon"></i>Playback settings
                                 </div>
-                                <div class="active content ui small form">
+                                <div class=" content ui small form">
                                     <div class="inline fields" style="padding: 0px;">
                                         <div class="ten wide field"><label style="min-width: 100px">Enable regex
                                                 <i class="question circle icon validate_regex"
@@ -229,7 +235,7 @@
                                                 data-value="false">Replay sequence</button>
                                         </div>
                                     </div>
-                                </div> -->
+                                </div>
                             </div>
                         </div>
                     </div>

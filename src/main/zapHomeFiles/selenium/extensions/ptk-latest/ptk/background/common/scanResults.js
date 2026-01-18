@@ -1,5 +1,16 @@
 const DEFAULT_VERSION = '1.0'
 
+function getToolVersion() {
+  try {
+    const manifest = typeof browser !== "undefined" && browser?.runtime?.getManifest
+      ? browser.runtime.getManifest()
+      : null
+    return manifest?.version || "unknown"
+  } catch (_) {
+    return "unknown"
+  }
+}
+
 /**
  * Create a shared scan-result envelope used by all engines.
  * Keeps legacy fields (items[]) so existing UI continues to render.
@@ -15,9 +26,11 @@ export function createScanResultEnvelope({ engine, scanId, host, tabId, startedA
     startedAt: startedAt || new Date().toISOString(),
     finishedAt: null,
     settings: settings || {},
+    toolVersion: getToolVersion(),
 
     stats: {
       findingsCount: 0,
+      attacksCount: 0,
       critical: 0,
       high: 0,
       medium: 0,
@@ -71,10 +84,11 @@ export function addFinding(envelope, finding) {
 
 function buildGroupId(finding, meta = {}) {
   if (meta.signature) return meta.signature
+  const runtimeUrl = meta.runtimeUrl ?? finding?.location?.runtimeUrl ?? finding?.location?.url ?? null
   const parts = [
     finding.engine || 'engine',
     finding.vulnId || 'vuln',
-    meta.url ?? finding?.location?.url ?? '',
+    meta.url ?? runtimeUrl ?? '',
     meta.file ?? finding?.location?.file ?? '',
     meta.param ?? finding?.location?.param ?? '',
     meta.sink ?? ''
@@ -94,6 +108,7 @@ export function addFindingToGroup(envelope, finding, groupId, groupMeta = {}) {
   }
   let group = envelope.groups.find(g => g.id === id)
   if (!group) {
+    const runtimeUrl = groupMeta.runtimeUrl ?? finding?.location?.runtimeUrl ?? finding?.location?.url ?? null
     group = {
       id,
       engine: finding.engine,
@@ -101,8 +116,10 @@ export function addFindingToGroup(envelope, finding, groupId, groupMeta = {}) {
       vulnId: finding.vulnId,
       category: finding.category,
       severity: finding.severity,
+      correlationKey: finding.correlationKey || null,
       location: {
-        url: groupMeta.url ?? finding?.location?.url ?? null,
+        url: groupMeta.url ?? runtimeUrl ?? null,
+        runtimeUrl: runtimeUrl,
         file: groupMeta.file ?? finding?.location?.file ?? null,
         param: groupMeta.param ?? finding?.location?.param ?? null,
         sink: groupMeta.sink ?? finding?.location?.sink ?? null

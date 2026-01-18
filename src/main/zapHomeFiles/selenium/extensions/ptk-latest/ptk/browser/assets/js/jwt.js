@@ -8,6 +8,7 @@ import { ptk_utils, ptk_jwtHelper } from "../../../background/utils.js"
 import { ptk_decoder } from "../../../background/decoder.js"
 import { ptk_controller_jwt } from "../../../controller/jwt.js"
 import { ptk_controller_session } from "../../../controller/session.js"
+import { registerDashboardTabListener, updateDashboardTab } from "../js/rutils.js"
 
 
 const controller = new ptk_controller_jwt()
@@ -910,7 +911,27 @@ jQuery(function () {
         })
     }
 
-    init()
+    async function initWithActiveTab() {
+        try {
+            const tabs = await browser.tabs.query({ currentWindow: true })
+            const active = tabs && tabs.length ? tabs.find((t) => t.active) : null
+            const base = browser.runtime.getURL('')
+            const isExtensionUrl = (url) => !!url && url.startsWith(base)
+            if (active?.id && active?.url && !isExtensionUrl(active.url)) {
+                await updateDashboardTab(active.id, active.url)
+            }
+        } catch (_) { }
+        init()
+    }
+
+    initWithActiveTab()
+
+    registerDashboardTabListener({
+        onTabChange: async ({ tabId, url }) => {
+            await updateDashboardTab(tabId, url)
+            init()
+        }
+    })
 
 
 })
@@ -971,6 +992,10 @@ function reset() {
 function bindTokens(tokens) {
     console.log(tokens)
     let selectedToken
+    if (!tokens.length) {
+        $("#source").dropdown('clear')
+        $("#source option").remove()
+    }
     for (let i = 0; i < tokens.length; i++) {
         editorMode = null
         $("#source").dropdown('clear')

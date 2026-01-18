@@ -3,6 +3,7 @@ import { dastEngine } from "./dast/dastEngine.js"
 import { ptk_utils, ptk_logger, ptk_storage } from "../background/utils.js"
 import { loadRulepack } from "./common/moduleRegistry.js"
 import { normalizeRulepack } from "./common/severity_utils.js"
+import buildExportScanResult from "./export/buildExportScanResult.js"
 
 
 const worker = self
@@ -14,6 +15,7 @@ export class ptk_rattacker {
         this.storageKey = "ptk_rattacker"
 
         this.engine = new dastEngine(this.settings)
+        this._sentAllAttacksCompleted = false
         this.addMessageListeners()
         this._acceptIncomingRequests = false
         this.automationSession = null
@@ -28,6 +30,14 @@ export class ptk_rattacker {
         } else {
             this.scanResult = this.engine.scanResult
         }
+    }
+
+    _cloneScanResultForUi() {
+        const clone = JSON.parse(JSON.stringify(this.scanResult || {}))
+        if (clone && typeof clone === "object") {
+            clone.__normalized = true
+        }
+        return clone
     }
 
     async reset() {
@@ -108,6 +118,13 @@ export class ptk_rattacker {
             ["responseHeaders"].concat(ptk_utils.extraInfoSpec)
         )
 
+        this.onHeadersReceived = this.onHeadersReceived.bind(this)
+        browser.webRequest.onHeadersReceived.addListener(
+            this.onHeadersReceived,
+            { urls: ["<all_urls>"], types: ptk_utils.requestFilters },
+            ["responseHeaders"].concat(ptk_utils.extraInfoSpec)
+        )
+
 
     }
 
@@ -115,6 +132,7 @@ export class ptk_rattacker {
         browser.tabs.onRemoved.removeListener(this.onRemoved)
         browser.webRequest.onCompleted.removeListener(this.onCompleted)
         browser.webRequest.onResponseStarted.removeListener(this.onResponseStarted)
+        browser.webRequest.onHeadersReceived.removeListener(this.onHeadersReceived)
     }
 
     onRemoved(tabId, info) {
@@ -128,11 +146,57 @@ export class ptk_rattacker {
         if (this.engine.isRunning && this._acceptIncomingRequests && this.engine.tabId == response.tabId) {
             try {
                 let rawRequest = worker.ptk_app.proxy.getRawRequest(worker.ptk_app.proxy.getTab(response.tabId), response.frameId, response.requestId)
+                let uiUrl = response.ui_url || response.url
+                if (typeof rawRequest === 'string') {
+                    const line = rawRequest.split(/\r?\n/)[0] || ''
+                    const parts = line.trim().split(/\s+/)
+                    const rawUrl = parts[1] || null
+                    if (rawUrl) {
+                        try {
+                            uiUrl = rawUrl.startsWith('http')
+                                ? rawUrl
+                                : new URL(rawUrl, response.url).toString()
+                        } catch (_) { }
+                    }
+                }
                 this.engine.enqueue({
                     raw: rawRequest,
-                    ui_url: response.ui_url || response.url,
+                    ui_url: uiUrl,
                     responseType: response.type
                 }, response)
+            } catch (e) { }
+        }
+    }
+
+    _enqueueRedirect(response) {
+        const status = response?.statusCode
+        if (status < 300 || status >= 400) return
+        const headers = response?.responseHeaders || []
+        const locationHeader = headers.find(
+            (h) => (h?.name || '').toLowerCase() === 'location'
+        )
+        const locationValue = locationHeader?.value || null
+        if (!locationValue) return
+        try {
+            const redirectUrl = new URL(locationValue, response.url).toString()
+            const urlObj = new URL(redirectUrl)
+            const syntheticRaw = `GET ${redirectUrl} HTTP/1.1\r\nHost: ${urlObj.host}\r\n\r\n`
+            const redirectResponse = Object.assign({}, response, {
+                url: redirectUrl,
+                ui_url: redirectUrl
+            })
+            this.engine.enqueue({
+                raw: syntheticRaw,
+                ui_url: redirectUrl,
+                responseType: response.type
+            }, redirectResponse)
+        } catch (_) { }
+    }
+
+    onHeadersReceived(response) {
+        if (this.engine.isRunning && this._acceptIncomingRequests && this.engine.tabId == response.tabId) {
+            try {
+                this._enqueueRedirect(response)
             } catch (e) { }
         }
     }
@@ -247,7 +311,7 @@ export class ptk_rattacker {
             if (message.type == 'start') {
                 console.log('start scan')
                 this.runBackroungScan(sender.tab.id, new URL(sender.origin).host)
-                return Promise.resolve({ success: true, scanResult: JSON.parse(JSON.stringify(this.scanResult)) })
+                return Promise.resolve({ success: true, scanResult: this._cloneScanResultForUi() })
             }
 
             if (message.type == 'stop') {
@@ -262,11 +326,40 @@ export class ptk_rattacker {
         await this.init()
         const defaultModules = await this.getDefaultModules()
         return Promise.resolve({
-            scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+            scanResult: this._cloneScanResultForUi(),
             isScanRunning: this.engine.isRunning,
             default_modules: defaultModules,
             activeTab: worker.ptk_app.proxy.activeTab,
             settings: this.settings
+        })
+    }
+
+    async msg_get_request_snapshot(message) {
+        const requestId = message?.requestId
+        if (!requestId) {
+            return Promise.resolve({ requestId: null, original: null, attack: null })
+        }
+        const requests = Array.isArray(this.scanResult?.requests) ? this.scanResult.requests : []
+        const record = requests.find(item => String(item?.id) === String(requestId)) || null
+        if (!record) {
+            return Promise.resolve({ requestId, original: null, attack: null })
+        }
+        const attackId = message?.attackId
+        let attack = null
+        if (attackId && Array.isArray(record.attacks)) {
+            attack = record.attacks.find(item => String(item?.id) === String(attackId)) || null
+        }
+        const clone = (val) => {
+            try {
+                return JSON.parse(JSON.stringify(val))
+            } catch (_) {
+                return val || null
+            }
+        }
+        return Promise.resolve({
+            requestId,
+            original: clone(record.original || null),
+            attack: clone(attack)
         })
     }
 
@@ -295,7 +388,13 @@ export class ptk_rattacker {
             if (!url) {
                 return { "success": false, "json": { "message": "Portal endpoint is not configured." } }
             }
-            const payload = JSON.parse(JSON.stringify(this.scanResult))
+            const payload = buildExportScanResult(this.scanResult?.scanId, {
+                target: "portal",
+                scanResult: this.scanResult
+            })
+            if (!payload) {
+                return { "success": false, "json": { "message": "Scan result is empty" } }
+            }
             if (message?.projectId) {
                 payload.projectId = message.projectId
             }
@@ -322,6 +421,27 @@ export class ptk_rattacker {
             return response
         } else {
             return { "success": false, "json": { "message": "No API key found" } }
+        }
+    }
+
+    async msg_export_scan_result(message) {
+        if (!this.scanResult || Object.keys(this.scanResult).length === 0) {
+            const stored = await ptk_storage.getItem(this.storageKey)
+            if (stored && stored.scanResult && Object.keys(stored.scanResult).length) {
+                this.scanResult = stored.scanResult
+            } else if (stored && Object.keys(stored).length) {
+                this.scanResult = stored
+            }
+        }
+        if (!this.scanResult) return null
+        try {
+            return buildExportScanResult(this.scanResult?.scanId, {
+                target: message?.target || "download",
+                scanResult: this.scanResult
+            })
+        } catch (err) {
+            console.error("[PTK DAST] Failed to export scan result", err)
+            throw err
         }
     }
 
@@ -470,7 +590,7 @@ export class ptk_rattacker {
         this.reset()
         const defaultModules = await this.getDefaultModules()
         return Promise.resolve({
-            scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+            scanResult: this._cloneScanResultForUi(),
             default_modules: defaultModules,
             activeTab: worker.ptk_app.proxy.activeTab
         })
@@ -501,7 +621,7 @@ export class ptk_rattacker {
         ptk_storage.setItem(this.storageKey, JSON.parse(JSON.stringify(normalized)))
         const defaultModules = await this.getDefaultModules()
         return Promise.resolve({
-            scanResult: JSON.parse(JSON.stringify(this.scanResult)),
+            scanResult: this._cloneScanResultForUi(),
             isScanRunning: this.engine.isRunning,
             default_modules: defaultModules,
             activeTab: worker.ptk_app.proxy.activeTab
@@ -510,19 +630,23 @@ export class ptk_rattacker {
 
     msg_run_bg_scan(message) {
         this.runBackroungScan(message.tabId, message.host, message.domains, message.settings)
-        return Promise.resolve({ isScanRunning: this.engine.isRunning, scanResult: JSON.parse(JSON.stringify(this.scanResult)) })
+        return Promise.resolve({ isScanRunning: this.engine.isRunning, scanResult: this._cloneScanResultForUi() })
     }
 
     msg_stop_bg_scan(message) {
         this.stopBackroungScan()
-        return Promise.resolve({ scanResult: JSON.parse(JSON.stringify(this.scanResult)) })
+        return Promise.resolve({ scanResult: this._cloneScanResultForUi() })
     }
 
     runBackroungScan(tabId, host, domains, settings) {
+        if (this.engine?.isRunning) {
+            return false
+        }
         const resolvedSettings = Object.assign({}, this.settings || {}, settings || {})
         const normalizedDomains = Array.isArray(domains) ? domains.join(',') : domains
         const targetDomains = normalizedDomains && normalizedDomains.length ? normalizedDomains : host
         this.reset()
+        this._sentAllAttacksCompleted = false
         this.addListeners()
         this._acceptIncomingRequests = true
         if(resolvedSettings.ws)
@@ -536,6 +660,20 @@ export class ptk_rattacker {
         this.scanResult = this.engine.scanResult
         if (this.scanResult) {
             this.scanResult.finished = new Date().toISOString()
+        }
+        if (!this._sentAllAttacksCompleted) {
+            this._sentAllAttacksCompleted = true
+            // Send completion once to avoid per-result message spam.
+            browser.runtime.sendMessage({
+                channel: "ptk_background2popup_rattacker",
+                type: "all attacks completed",
+                info: { completed: true }
+            }).catch(e => e)
+            browser.runtime.sendMessage({
+                channel: "ptk_background2popup_rattacker",
+                type: "dast_scan_completed",
+                info: { completed: true }
+            }).catch(e => e)
         }
         ptk_storage.setItem(this.storageKey, this.scanResult)
         this.unregisterScript()
@@ -583,7 +721,7 @@ export class ptk_rattacker {
         const stats = this._collectSeverityStats()
         this.automationSession = null
         return {
-            vulnsCount: stats.vulnsCount,
+            findingsCount: stats.findingsCount,
             bySeverity: Object.assign({
                 info: 0,
                 low: 0,
@@ -636,15 +774,17 @@ export class ptk_rattacker {
             }
         }
         const stats = this.scanResult?.stats || {}
-        const vulnsFromCounts = counts.info + counts.low + counts.medium + counts.high + counts.critical
-        const vulnsCount = stats?.vulnsCount && stats.vulnsCount > vulnsFromCounts ? stats.vulnsCount : vulnsFromCounts
-        return { counts, vulnsCount }
+        const findingsFromCounts = counts.info + counts.low + counts.medium + counts.high + counts.critical
+        const findingsCount = stats?.findingsCount && stats.findingsCount > findingsFromCounts
+            ? stats.findingsCount
+            : findingsFromCounts
+        return { counts, findingsCount }
     }
 
     getAutomationStats() {
         const severity = this._collectSeverityStats()
         return {
-            vulnsCount: severity.vulnsCount,
+            findingsCount: severity.findingsCount,
             bySeverity: Object.assign({}, severity.counts)
         }
     }

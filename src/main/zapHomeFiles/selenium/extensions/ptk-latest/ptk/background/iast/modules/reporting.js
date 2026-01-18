@@ -1,4 +1,6 @@
 import CryptoES from "../../../packages/crypto-es/index.js"
+import { normalizeCwe, normalizeOwasp } from "../../common/normalizeMappings.js"
+import { resolveFindingTaxonomy } from "../../common/resolveFindingTaxonomy.js"
 
 const ENGINE_IAST = "IAST"
 const DEFAULT_CATEGORY = "runtime_issue"
@@ -18,8 +20,8 @@ export function createFindingFromIAST(details = {}, meta = {}) {
     const location = buildLocation(details)
     const sinkId = details?.sinkId || details?.sink || null
     const taintSource = details?.taintSource || details?.source || details?.matched || null
-    const cwe = details?.cwe || null
-    const owasp = details?.owasp || null
+    const cwe = normalizeCwe(details?.cwe || details?.meta?.cwe)
+    const owasp = normalizeOwasp(details?.owasp || details?.meta?.owasp)
     const ruleId = details?.ruleId || null
     const moduleId = details?.moduleId || null
     const moduleName = details?.moduleName || details?.meta?.moduleName || null
@@ -37,12 +39,17 @@ export function createFindingFromIAST(details = {}, meta = {}) {
         contextKey
     })
     const evidence = buildIASTEvidence(details)
+    const confidenceDetails = resolveIastConfidence(details, evidence)
+    if (confidenceDetails.signals.length) {
+        evidence.confidenceSignals = confidenceDetails.signals
+    }
 
-    return {
+    const finding = {
         id: `${fingerprint}:${details?.timestamp || Date.now()}`,
         fingerprint,
         category,
         severity,
+        confidence: confidenceDetails.confidence,
         cwe,
         owasp,
         location,
@@ -58,29 +65,50 @@ export function createFindingFromIAST(details = {}, meta = {}) {
         source: taintSource,
         taintSource,
         engines: [ENGINE_IAST],
-        evidence: [evidence],
+        evidence: { iast: evidence },
         scanId: meta?.scanId || null,
         attackId: null,
         policyId: null,
         createdAt: now,
         updatedAt: now
     }
+    resolveFindingTaxonomy({
+        finding,
+        ruleMeta: details?.meta?.ruleMeta || details?.meta || {},
+        moduleMeta: details?.meta?.moduleMeta || details?.meta || {}
+    })
+    return finding
+}
+
+export function getIastEvidencePayload(finding = {}) {
+    if (!finding) return null
+    const evidence = finding.evidence
+    if (!evidence) return null
+    if (Array.isArray(evidence)) {
+        return evidence.find(entry => entry && typeof entry === "object") || null
+    }
+    if (evidence.iast && typeof evidence.iast === "object") {
+        return evidence.iast
+    }
+    if (typeof evidence === "object") {
+        return evidence
+    }
+    return null
 }
 
 export function getFindingFingerprint(finding = {}) {
     if (finding?.fingerprint) return finding.fingerprint
-    const evidence = getPrimaryEvidence(finding)
+    const evidence = getIastEvidencePayload(finding) || {}
     const fallbackSource = finding?.taintSummary?.primarySource || finding?.source || null
     const contextKey =
         extractContextKey(evidence?.context) ||
-        extractContextKey(evidence?.raw?.context) ||
         extractContextKey(finding?.location) ||
         null
     return buildFingerprint({
         url: extractLocationUrl(finding?.location),
-        sink: evidence?.sinkId || evidence?.raw?.sinkId || evidence?.raw?.sink || finding?.sinkId || null,
-        category: finding?.category || evidence?.raw?.type || null,
-        source: evidence?.taintSource || evidence?.raw?.taintSource || evidence?.raw?.source || fallbackSource,
+        sink: evidence?.sinkId || finding?.sinkId || null,
+        category: finding?.category || null,
+        source: evidence?.taintSource || fallbackSource,
         contextKey
     })
 }
@@ -92,8 +120,8 @@ export function mergeFinding(existingFinding, newFinding) {
     existingFinding.severity = pickHigherSeverity(existingFinding.severity, newFinding.severity)
     existingFinding.category = existingFinding.category || newFinding.category
     existingFinding.location = existingFinding.location || newFinding.location
-    existingFinding.cwe = existingFinding.cwe || newFinding.cwe
-    existingFinding.owasp = existingFinding.owasp || newFinding.owasp
+    existingFinding.cwe = mergeCweSets(existingFinding.cwe, newFinding.cwe)
+    existingFinding.owasp = mergeOwaspSets(existingFinding.owasp, newFinding.owasp)
     existingFinding.ruleId = existingFinding.ruleId || newFinding.ruleId
     existingFinding.moduleId = existingFinding.moduleId || newFinding.moduleId
     existingFinding.moduleName = existingFinding.moduleName || newFinding.moduleName
@@ -112,23 +140,101 @@ export function mergeFinding(existingFinding, newFinding) {
     return existingFinding
 }
 
+function mergeOwaspSets(base, incoming) {
+    const combined = []
+    if (Array.isArray(base)) combined.push(...base)
+    if (Array.isArray(incoming)) combined.push(...incoming)
+    if (!combined.length) return []
+    return normalizeOwasp(combined)
+}
+
+function mergeCweSets(base, incoming) {
+    const combined = []
+    if (Array.isArray(base)) combined.push(...base)
+    if (Array.isArray(incoming)) combined.push(...incoming)
+    if (!combined.length) return []
+    return normalizeCwe(combined)
+}
+
 function buildIASTEvidence(details = {}) {
     const sinkId = details?.sinkId || details?.sink || null
     const taintSource = details?.taintSource || details?.source || null
     return {
-        source: ENGINE_IAST,
-        type: "iast_sink",
         sinkId,
         matched: details?.matched || null,
         taintSource,
+        source: details?.source || null,
+        sourceKind: details?.sourceKind || null,
+        sourceKey: details?.sourceKey || null,
+        sourceValuePreview: details?.sourceValuePreview || null,
+        primarySource: details?.primarySource || null,
+        secondarySources: details?.secondarySources || null,
+        sources: Array.isArray(details?.sources) ? details.sources : (Array.isArray(details?.taintedSources) ? details.taintedSources : null),
+        sink: details?.sink || null,
+        sinkContext: details?.sinkContext || null,
         context: details?.context || {},
-        trace: details?.trace || null,
+        schemaVersion: details?.schemaVersion || null,
+        primaryClass: details?.primaryClass || null,
+        sourceRole: details?.sourceRole || null,
+        origin: details?.origin || null,
+        observedAt: details?.observedAt || null,
+        operation: details?.operation || null,
+        detection: details?.detection || null,
+        routing: details?.routing || null,
+        trace: details?.trace || details?.flow || null,
+        traceSummary: details?.traceSummary || null,
+        flowSummary: details?.flowSummary || null,
         ruleId: details?.ruleId || null,
         moduleId: details?.moduleId || null,
         moduleName: details?.moduleName || null,
         message: details?.message || null,
-        raw: details
+        requestId: details?.requestId || details?.meta?.requestId || null
     }
+}
+
+function clampConfidence(value) {
+    if (!Number.isFinite(value)) return null
+    return Math.min(100, Math.max(0, Math.round(value)))
+}
+
+function resolveIastConfidence(details = {}, evidence = {}) {
+    const signals = []
+    const ruleMetaRaw = details?.meta?.ruleMeta?.metadata || details?.meta?.ruleMeta || {}
+    const moduleMetaRaw = details?.meta?.moduleMeta?.metadata || details?.meta?.moduleMeta || {}
+    const override =
+        details?.confidence ??
+        details?.meta?.confidence ??
+        ruleMetaRaw.confidence ??
+        ruleMetaRaw.confidenceDefault ??
+        moduleMetaRaw.confidenceDefault
+
+    if (Number.isFinite(override)) {
+        const value = clampConfidence(override)
+        return { confidence: value, signals: [`override:${value}`] }
+    }
+
+    let confidence = 90
+    signals.push("base:90")
+
+    const taintSource = evidence?.taintSource || details?.taintSource || details?.source || null
+    const sinkId = evidence?.sinkId || details?.sinkId || details?.sink || null
+    const trace = details?.trace || details?.flow || evidence?.trace || null
+    const traceLen = Array.isArray(trace) ? trace.length : 0
+
+    if (!taintSource) {
+        confidence -= 15
+        signals.push("missing:source:-15")
+    }
+    if (!sinkId) {
+        confidence -= 10
+        signals.push("missing:sink:-10")
+    }
+    if (traceLen === 0) {
+        confidence -= 10
+        signals.push("trace:none:-10")
+    }
+
+    return { confidence: clampConfidence(confidence), signals }
 }
 
 function normalizeSeverity(severity) {
@@ -230,31 +336,20 @@ function mergeEngines(existing = [], incoming = []) {
     return Array.from(merged)
 }
 
-function mergeEvidence(existing = [], incoming = []) {
-    const evidence = Array.isArray(existing) ? [...existing] : []
-    const incomingEvidence = Array.isArray(incoming) ? incoming : []
-    incomingEvidence.forEach(ev => {
-        if (!ev) return
-        if (!hasEvidence(evidence, ev)) {
-            evidence.push(ev)
-        }
-    })
-    return evidence
-}
-
-function hasEvidence(collection, candidate) {
-    return collection.some(item => (
-        item?.source === candidate?.source &&
-        item?.type === candidate?.type &&
-        item?.sinkId === candidate?.sinkId &&
-        item?.matched === candidate?.matched &&
-        item?.trace === candidate?.trace
-    ))
-}
-
-function getPrimaryEvidence(finding = {}) {
-    if (!Array.isArray(finding?.evidence)) return null
-    return finding.evidence.find(e => e?.source === ENGINE_IAST) || finding.evidence[0]
+function mergeEvidence(existing, incoming) {
+    const base = getIastEvidencePayload({ evidence: existing }) || {}
+    const next = getIastEvidencePayload({ evidence: incoming }) || {}
+    const merged = {
+        requestId: next.requestId || base.requestId || null,
+        sinkId: next.sinkId || base.sinkId || null,
+        sourceId: next.sourceId || base.sourceId || null,
+        taintSource: next.taintSource || base.taintSource || null,
+        matched: next.matched || base.matched || null,
+        trace: next.trace || base.trace || null,
+        context: next.context || base.context || null,
+        message: next.message || base.message || null
+    }
+    return { iast: merged }
 }
 
 function pickHigherSeverity(existing, incoming) {
