@@ -1,4 +1,5 @@
 import org.zaproxy.gradle.addon.AddOnStatus
+import org.zaproxy.gradle.addon.misc.ConvertMarkdownToHtml
 
 plugins {
     `java-library`
@@ -18,6 +19,8 @@ zapAddOn {
     manifest {
         author.set("ZAP Dev Team")
         url.set("https://www.zaproxy.org/docs/desktop/addons/owasp-ptk/")
+        repo.set("https://github.com/DenisPodgurskii/ZAP_PTK")
+        changesFile.set(tasks.named<ConvertMarkdownToHtml>("generateManifestChanges").flatMap { it.html })
 
         helpSet {
             baseName.set("org.zaproxy.addon.ptk.resources.help%LC%.helpset")
